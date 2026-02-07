@@ -1,28 +1,29 @@
 //+------------------------------------------------------------------+
 //|                                          AdaptiveRegimeEA.mq5    |
 //|                        Adaptive Market Regime Expert Advisor      |
-//|                           v5.0 - Best-in-Class Implementation     |
+//|                           v5.1 - Expert-Reviewed Overhaul         |
 //|                                                                    |
-//|  v5.0 Changes (Mathematical & Financial Engineering Overhaul):    |
-//|  [MATH]     Fixed R:R ratios: 3:1 trend, 2:1 MR (positive EV)    |
-//|  [MATH]     Kelly Criterion position sizing with safety factor    |
-//|  [MATH]     Removed regime size scaling that destroyed expectancy |
-//|  [QUANT]    Expected Value calculation pre-trade validation       |
-//|  [QUANT]    Sharpe ratio tracking with regime breakdown           |
-//|  [QUANT]    MAE/MFE tracking for exit optimization                |
-//|  [TRADING]  Smart partial close: regime-dependent, asymmetric     |
-//|  [TRADING]  Dynamic trailing: volatility-adjusted, profit-locked  |
-//|  [TRADING]  Improved entry: momentum + volume confluence          |
-//|  [TRADING]  Reduced regime lag: 1-bar confirmation                |
-//|  [RISK]     Stricter spread filter: 5% max cost (was 15%)         |
-//|  [RISK]     Portfolio heat management with correlation            |
-//|  [RISK]     Time-decay position sizing for aging trades           |
-//|  [ANALYTICS] Real-time performance metrics by regime              |
-//|  [ANALYTICS] Trade quality scoring and filtering                  |
-//|  [ANALYTICS] Statistical validation framework                     |
+//|  v5.1 Changes (Expert Panel Review - All Critical Fixes):         |
+//|  [CRITICAL] Fixed death spiral: EV blocking re-enabled properly   |
+//|  [CRITICAL] Fixed GlobalVariable leak into Strategy Tester        |
+//|  [CRITICAL] Fixed partial close double-counting in Kelly stats    |
+//|  [CRITICAL] Fixed R-multiple uses entry ATR, not close-time ATR   |
+//|  [CRITICAL] Fixed EMA alpha destroys bootstrap on first trade     |
+//|  [HIGH]     Eliminated UNKNOWN regime dead zone (20-35% recovery) |
+//|  [HIGH]     Fixed STRONG_TREND + NEUTRAL paradox (Tier 3+4)       |
+//|  [HIGH]     Negative Kelly now reduces risk instead of ignoring   |
+//|  [HIGH]     Relaxed MR AND-gate: BB + 1 oscillator + 1 turning   |
+//|  [HIGH]     Relaxed trend AND-gate: removed candle shape filter   |
+//|  [MEDIUM]   Win rate floor raised to 35% (matches effective BE)   |
+//|  [MEDIUM]   Bootstrap WR corrected from 75% to 50%               |
+//|  [MEDIUM]   Partial close uses entry regime, not current regime   |
+//|  [MEDIUM]   Break-even skipped when trailing also fires           |
+//|  [MEDIUM]   Cooldown multiplier capped at 2x (was 3x)            |
+//|  [MEDIUM]   Quality score uses bar[1] ATR, session-aware bonus    |
+//|  [PERF]     ManageOpenPositions uses entry ATR from tracker       |
 //+------------------------------------------------------------------+
-#property copyright "AdaptiveRegimeEA v5.0"
-#property version   "5.00"
+#property copyright "AdaptiveRegimeEA v5.1"
+#property version   "5.10"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -75,7 +76,7 @@ input double      InpADXStrongThresh    = 35.0;       // ADX Strong Trend Thresh
 input int         InpBBPeriod           = 20;         // Bollinger Band Period
 input double      InpBBDeviation        = 2.0;        // Bollinger Band Deviation
 input int         InpRegimeLookback     = 20;         // Regime BBW Lookback (bars)
-input int         InpRegimeConfirmBars  = 1;          // Bars to confirm regime change (v5: reduced lag)
+input int         InpRegimeConfirmBars  = 1;          // Bars to confirm regime change
 
 input group "=== Trend Following ==="
 input int         InpFastEMA            = 8;          // Fast EMA Period
@@ -87,48 +88,48 @@ input double      InpTrendRSIOS         = 30.0;       // RSI Oversold (trend)
 
 input group "=== Mean Reversion ==="
 input int         InpMR_RSIPeriod       = 7;          // RSI Period (MR)
-input double      InpMR_RSI_OB          = 75.0;       // RSI Overbought (MR)
-input double      InpMR_RSI_OS          = 25.0;       // RSI Oversold (MR)
+input double      InpMR_RSI_OB          = 70.0;       // RSI Overbought (MR) - v5.1: widened from 75
+input double      InpMR_RSI_OS          = 30.0;       // RSI Oversold (MR) - v5.1: widened from 25
 input int         InpMR_StochK          = 14;         // Stochastic %K
 input int         InpMR_StochD          = 3;          // Stochastic %D
 input int         InpMR_StochSlow       = 3;          // Stochastic Slowing
-input double      InpMR_StochOB         = 80.0;       // Stochastic OB
-input double      InpMR_StochOS         = 20.0;       // Stochastic OS
+input double      InpMR_StochOB         = 75.0;       // Stochastic OB - v5.1: widened from 80
+input double      InpMR_StochOS         = 25.0;       // Stochastic OS - v5.1: widened from 20
 
 input group "=== Risk Management ==="
 input double      InpRiskPercent        = 1.0;        // Base Risk Per Trade (%)
 input double      InpMaxRiskPercent     = 3.0;        // Max Total Portfolio Risk (%)
-input double      InpATRMultSL          = 1.5;        // ATR Mult SL (trend) - v5: tighter for better R:R
-input double      InpATRMultTP          = 4.5;        // ATR Mult TP (trend) - v5: 3:1 ratio
-input double      InpMR_ATRSL           = 1.0;        // ATR Mult SL (mean reversion) - v5: tight stop
-input double      InpMR_ATRTP           = 2.0;        // ATR Mult TP (mean reversion) - v5: 2:1 ratio
+input double      InpATRMultSL          = 1.5;        // ATR Mult SL (trend)
+input double      InpATRMultTP          = 4.5;        // ATR Mult TP (trend) - 3:1 ratio
+input double      InpMR_ATRSL           = 1.0;        // ATR Mult SL (mean reversion)
+input double      InpMR_ATRTP           = 2.0;        // ATR Mult TP (mean reversion) - 2:1 ratio
 input int         InpATRPeriod          = 14;         // ATR Period
 input double      InpMaxDailyLossPct    = 3.0;        // Max Daily Loss (%)
 input double      InpMaxDrawdownPct     = 10.0;       // Max DD Circuit Breaker (%)
 input int         InpMaxPositions       = 3;          // Max Concurrent Positions
 input int         InpMaxTradesPerDay    = 8;          // Max Trades Per Day
-input bool        InpUseKellyCriterion  = true;       // v5: Use Kelly Criterion Sizing
-input double      InpKellyFraction      = 0.25;       // v5: Kelly Safety Factor (0.25 = quarter-Kelly)
+input bool        InpUseKellyCriterion  = true;       // Use Kelly Criterion Sizing
+input double      InpKellyFraction      = 0.25;       // Kelly Safety Factor (0.25 = quarter-Kelly)
 
 input group "=== Filters ==="
-input double      InpMaxSpreadCostPct   = 5.0;        // v5: Max Spread as % of TP (trend) - much stricter
-input double      InpMaxSpreadCostMR    = 3.0;        // v5: Max Spread as % of TP (MR) - much stricter
+input double      InpMaxSpreadCostPct   = 5.0;        // Max Spread as % of TP (trend)
+input double      InpMaxSpreadCostMR    = 3.0;        // Max Spread as % of TP (MR)
 input int         InpCooldownBars       = 5;          // Cooldown bars after 2+ consecutive losses
 input int         InpMaxConsecLosses    = 3;          // Extended pause after N consecutive losses
-input double      InpMinTradeQuality    = 0.6;        // v5: Min Quality Score (0-1) to enter trade
+input double      InpMinTradeQuality    = 0.55;       // Min Quality Score (0-1) - v5.1: lowered from 0.6
 
 input group "=== Trade Management ==="
 input bool        InpUsePartialClose    = true;       // Use Partial Close
-input double      InpPartialClosePct    = 30.0;       // v5: Partial Close % (reduced from 50%)
-input double      InpPartialCloseATR    = 2.5;        // v5: Partial ATR trigger (delayed from 1.5)
-input bool        InpPartialOnlyStrong  = true;       // v5: Partial Close only in STRONG_TREND
+input double      InpPartialClosePct    = 30.0;       // Partial Close %
+input double      InpPartialCloseATR    = 2.5;        // Partial ATR trigger
+input bool        InpPartialOnlyStrong  = true;       // Partial Close only in STRONG_TREND
 input bool        InpUseTrailingStop    = true;       // Use Trailing Stop
-input double      InpTrailATRMult       = 1.0;        // v5: Trail ATR distance (tighter from 1.5)
-input double      InpTrailActivateATR   = 1.5;        // v5: Trail activate ATR (higher threshold)
-input bool        InpUseDynamicTrail    = true;       // v5: Dynamic trailing based on volatility
+input double      InpTrailATRMult       = 1.0;        // Trail ATR distance
+input double      InpTrailActivateATR   = 1.5;        // Trail activate ATR
+input bool        InpUseDynamicTrail    = true;       // Dynamic trailing based on volatility
 input bool        InpUseBreakEven       = true;       // Use Break-Even
-input double      InpBreakEvenATR       = 0.8;        // v5: Break-Even ATR (earlier activation)
-input double      InpBreakEvenOffset    = 0.3;        // v5: Break-Even offset ATR (more cushion)
+input double      InpBreakEvenATR       = 0.8;        // Break-Even ATR
+input double      InpBreakEvenOffset    = 0.3;        // Break-Even offset ATR
 input int         InpMaxHoldBars        = 100;        // Max Hold Bars (0=off)
 
 input group "=== Session Filter ==="
@@ -189,14 +190,15 @@ struct TradeRecord
    ENUM_SIGNAL    direction;
    double         openPrice;
    datetime       openTime;
-   double         maxMAE;        // v5: Maximum Adverse Excursion
-   double         maxMFE;        // v5: Maximum Favorable Excursion
-   double         qualityScore;  // v5: Trade quality at entry
+   double         entryATR;      // v5.1: ATR at entry time for consistent R-multiple
+   double         maxMAE;        // Maximum Adverse Excursion
+   double         maxMFE;        // Maximum Favorable Excursion
+   double         qualityScore;  // Trade quality at entry
 };
 TradeRecord    activeTracker[];
 datetime       lastTrackerCleanup   = 0;
 
-// v5: Performance Analytics
+// Performance Analytics
 struct RegimeStats
 {
    int    trades;
@@ -210,13 +212,17 @@ struct RegimeStats
 };
 RegimeStats stats_StrongTrend, stats_WeakTrend, stats_Ranging;
 
-// v5: Kelly Criterion tracking
-double   historicalWinRate     = 0.75;  // Bootstrap with conservative estimate
+// Kelly Criterion tracking
+double   historicalWinRate     = 0.50;  // v5.1: Bootstrap at 50% (was 75% - too optimistic)
 double   historicalAvgWin      = 2.0;   // In R multiples
 double   historicalAvgLoss     = 1.0;   // In R multiples
 int      totalClosedTrades     = 0;
+int      totalWins             = 0;     // v5.1: Simple counters for early trades
+double   sumWinR               = 0;     // v5.1: Sum of winning R-multiples
+double   sumLossR              = 0;     // v5.1: Sum of losing R-multiples
+int      totalLosses           = 0;     // v5.1: Simple loss counter
 
-// v5: Real-time performance
+// Real-time performance
 double   todayProfitFactor     = 0;
 double   currentSharpe         = 0;
 double   maxAdverseExcursion   = 0;
@@ -246,6 +252,9 @@ string GVPrefix()
 
 void SaveState()
 {
+   // v5.1: Never persist state during backtesting (causes stale data leaks)
+   if(MQLInfoInteger(MQL_TESTER)) return;
+
    string pfx = GVPrefix();
    GlobalVariableSet(pfx + "peakBalance",       peakBalance);
    GlobalVariableSet(pfx + "dailyStartBal",     dailyStartBalance);
@@ -256,7 +265,6 @@ void SaveState()
    GlobalVariableSet(pfx + "lastBarTime",        (double)lastBarTime);
    GlobalVariableSet(pfx + "consecLosses",       (double)consecutiveLosses);
    GlobalVariableSet(pfx + "lastLossTime",       (double)lastLossTime);
-   // v5: Kelly tracking
    GlobalVariableSet(pfx + "winRate",            historicalWinRate);
    GlobalVariableSet(pfx + "avgWin",             historicalAvgWin);
    GlobalVariableSet(pfx + "avgLoss",            historicalAvgLoss);
@@ -265,6 +273,9 @@ void SaveState()
 
 void LoadState()
 {
+   // v5.1: Never load stale state in Strategy Tester (prevents unreproducible results)
+   if(MQLInfoInteger(MQL_TESTER)) return;
+
    string pfx = GVPrefix();
    if(!GlobalVariableCheck(pfx + "peakBalance")) return;
 
@@ -290,7 +301,6 @@ void LoadState()
    consecutiveLosses    = (int)GlobalVariableGet(pfx + "consecLosses");
    lastLossTime         = (datetime)(long)GlobalVariableGet(pfx + "lastLossTime");
 
-   // v5: Load Kelly parameters
    if(GlobalVariableCheck(pfx + "winRate"))
    {
       historicalWinRate  = GlobalVariableGet(pfx + "winRate");
@@ -348,22 +358,17 @@ int OnInit()
       h_RSI_LTF == INVALID_HANDLE || h_ATR_LTF == INVALID_HANDLE)
    { Print("ERROR: Indicator handle creation failed"); return INIT_FAILED; }
 
-   // Load persisted state first
    LoadState();
    if(peakBalance <= 0)       peakBalance = accInfo.Balance();
    if(dailyStartBalance <= 0) dailyStartBalance = accInfo.Balance();
 
-   Print("=== AdaptiveRegimeEA v5.0 BEST-IN-CLASS initialized ===");
-   Print("Symbol=", _Symbol, " | Fill=", EnumToString(DetectFillingMode()));
+   Print("=== AdaptiveRegimeEA v5.1 initialized ===");
+   Print("Symbol=", _Symbol, " | Fill=", EnumToString(DetectFillingMode()),
+         " | Tester=", (MQLInfoInteger(MQL_TESTER) ? "YES" : "NO"));
    Print("Risk=", InpRiskPercent, "% | Kelly=", (InpUseKellyCriterion ? "ON" : "OFF"),
          " (", DoubleToString(InpKellyFraction*100, 0), "%)");
    Print("R:R Ratios: Trend ", DoubleToString(InpATRMultTP/InpATRMultSL, 1), ":1",
          " | MR ", DoubleToString(InpMR_ATRTP/InpMR_ATRSL, 1), ":1");
-   Print("SL/TP: SL_T=", InpATRMultSL, " | TP_T=", InpATRMultTP,
-         " | SL_MR=", InpMR_ATRSL, " | TP_MR=", InpMR_ATRTP);
-   Print("Trade Mgmt: Partial=", (InpUsePartialClose ? "ON" : "OFF"),
-         " (", DoubleToString(InpPartialClosePct, 0), "% @", InpPartialCloseATR, "R)",
-         " | Trail=", (InpUseTrailingStop ? (InpUseDynamicTrail ? "DYNAMIC" : "FIXED") : "OFF"));
    Print("Filters: Spread<", InpMaxSpreadCostPct, "% | Quality>", InpMinTradeQuality);
 
    return INIT_SUCCEEDED;
@@ -478,12 +483,12 @@ void OnTick()
       signal = SIGNAL_NONE;
    }
 
-   // v5: Quality scoring filter
+   // Quality scoring filter
    double quality = 0;
    if(signal != SIGNAL_NONE)
    {
       quality = CalculateTradeQuality(signal);
-      double qualityThreshold = InpDiagnosticMode ? 0.45 : InpMinTradeQuality; // Lower threshold in diagnostic mode
+      double qualityThreshold = InpDiagnosticMode ? 0.40 : InpMinTradeQuality;
       if(quality < qualityThreshold)
       {
          Print("BLOCKED: Quality filter: ", DoubleToString(quality, 2), " < ", DoubleToString(qualityThreshold, 2),
@@ -492,8 +497,7 @@ void OnTick()
       }
       else
       {
-         if(InpVerboseLog) Print("Quality OK: ", DoubleToString(quality, 2), " >= ", DoubleToString(qualityThreshold, 2),
-                                 (InpDiagnosticMode ? " [DIAG MODE]" : ""));
+         if(InpVerboseLog) Print("Quality OK: ", DoubleToString(quality, 2), " >= ", DoubleToString(qualityThreshold, 2));
       }
    }
 
@@ -511,6 +515,7 @@ void OnTick()
 
 //+------------------------------------------------------------------+
 //| OnTradeTransaction - Track wins/losses for cooldown + journal     |
+//| v5.1: Uses entry ATR, skips partial closes for Kelly updates      |
 //+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
@@ -533,11 +538,11 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                  + HistoryDealGetDouble(dealTicket, DEAL_SWAP)
                  + HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
 
-   // Find regime this trade was opened under + v5 analytics
+   // Find regime this trade was opened under + analytics
    ulong posId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
    ENUM_REGIME tradeRegime = REGIME_UNKNOWN;
    double mae = 0, mfe = 0, quality = 0;
-   double slDist = 0;
+   double entryATR = 0;
 
    for(int i = 0; i < ArraySize(activeTracker); i++)
    {
@@ -547,75 +552,80 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
          mae = activeTracker[i].maxMAE;
          mfe = activeTracker[i].maxMFE;
          quality = activeTracker[i].qualityScore;
-
-         // Get SL distance for R-multiple calculation
-         if(HistorySelectByPosition(posId))
-         {
-            int totalDeals = HistoryDealsTotal();
-            for(int d = 0; d < totalDeals; d++)
-            {
-               ulong dTicket = HistoryDealGetTicket(d);
-               if(HistoryDealGetInteger(dTicket, DEAL_ENTRY) == DEAL_ENTRY_IN)
-               {
-                  double entryPrice = HistoryDealGetDouble(dTicket, DEAL_PRICE);
-                  // Estimate SL distance (1.5 ATR for trend, 1.0 for MR)
-                  double atr_v[];
-                  ArraySetAsSeries(atr_v, true);
-                  if(CopyBuffer(h_ATR_MTF, 0, 0, 1, atr_v) >= 1)
-                  {
-                     slDist = (tradeRegime == REGIME_RANGING) ? atr_v[0] * InpMR_ATRSL : atr_v[0] * InpATRMultSL;
-                  }
-                  break;
-               }
-            }
-         }
+         entryATR = activeTracker[i].entryATR;
          break;
       }
    }
 
-   // v5: Calculate R-multiple
-   double rMultiple = (slDist > 0) ? (profit / (slDist * SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE) * HistoryDealGetDouble(dealTicket, DEAL_VOLUME) / SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE))) : 0;
+   // v5.1: Calculate SL distance using ENTRY ATR (not current ATR)
+   double slDist = 0;
+   if(entryATR > 0)
+      slDist = (tradeRegime == REGIME_RANGING) ? entryATR * InpMR_ATRSL : entryATR * InpATRMultSL;
 
-   // v5: Update Kelly Criterion parameters
-   totalClosedTrades++;
-   if(totalClosedTrades >= 1)
+   // Calculate R-multiple
+   double rMultiple = 0;
+   if(slDist > 0)
    {
-      double oldWR = historicalWinRate;
-      double oldAvgWin = historicalAvgWin;
-      double oldAvgLoss = historicalAvgLoss;
+      double tv = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+      double ts = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+      double vol = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
+      if(ts > 0 && tv > 0 && vol > 0)
+         rMultiple = profit / ((slDist / ts) * tv * vol);
+   }
 
-      // Exponential moving average with weight on recent trades
-      double alpha = MathMin(0.1, 2.0 / (totalClosedTrades + 1)); // EMA weight
+   // v5.1: Check if this is a partial close (position still exists)
+   bool isPartialClose = PositionSelectByTicket(posId);
 
-      if(profit > 0)
+   // v5.1: Only update Kelly stats on FINAL close (not partial closes)
+   if(!isPartialClose && slDist > 0)
+   {
+      totalClosedTrades++;
+
+      // v5.1: Use simple running average for first 30 trades, then EMA
+      if(totalClosedTrades <= 30)
       {
-         historicalWinRate = historicalWinRate * (1.0 - alpha) + alpha * 1.0;
-         if(slDist > 0)
-            historicalAvgWin = historicalAvgWin * (1.0 - alpha) + alpha * MathAbs(rMultiple);
+         // Simple arithmetic average (stable with small samples)
+         if(profit > 0)
+         {
+            totalWins++;
+            sumWinR += MathAbs(rMultiple);
+         }
+         else
+         {
+            totalLosses++;
+            sumLossR += MathAbs(rMultiple);
+         }
+         historicalWinRate = (double)totalWins / totalClosedTrades;
+         if(totalWins > 0) historicalAvgWin = sumWinR / totalWins;
+         if(totalLosses > 0) historicalAvgLoss = sumLossR / totalLosses;
       }
       else
       {
-         historicalWinRate = historicalWinRate * (1.0 - alpha) + alpha * 0.0;
-         if(slDist > 0)
+         // EMA with fixed small alpha (stable)
+         double alpha = 0.05;
+         if(profit > 0)
+         {
+            historicalWinRate = historicalWinRate * (1.0 - alpha) + alpha * 1.0;
+            historicalAvgWin = historicalAvgWin * (1.0 - alpha) + alpha * MathAbs(rMultiple);
+         }
+         else
+         {
+            historicalWinRate = historicalWinRate * (1.0 - alpha) + alpha * 0.0;
             historicalAvgLoss = historicalAvgLoss * (1.0 - alpha) + alpha * MathAbs(rMultiple);
+         }
       }
-      // Floor win rate at 30% to prevent death spiral (no trades -> no recovery)
-      historicalWinRate = MathMax(historicalWinRate, 0.30);
+      // v5.1: Floor win rate at 35% (effective breakeven with partials ~34.5%)
+      historicalWinRate = MathMax(historicalWinRate, 0.35);
    }
 
-   // v5: Update regime-specific statistics
+   // Update regime-specific statistics (include partial closes for P&L tracking)
    if(tradeRegime == REGIME_STRONG_TREND)
    {
       stats_StrongTrend.trades++;
       if(profit > 0)
-      {
-         stats_StrongTrend.wins++;
-         stats_StrongTrend.totalProfit += profit;
-      }
+      { stats_StrongTrend.wins++; stats_StrongTrend.totalProfit += profit; }
       else
-      {
-         stats_StrongTrend.totalLoss += MathAbs(profit);
-      }
+      { stats_StrongTrend.totalLoss += MathAbs(profit); }
       stats_StrongTrend.avgWin = (stats_StrongTrend.wins > 0) ? stats_StrongTrend.totalProfit / stats_StrongTrend.wins : 0;
       stats_StrongTrend.avgLoss = ((stats_StrongTrend.trades - stats_StrongTrend.wins) > 0) ? stats_StrongTrend.totalLoss / (stats_StrongTrend.trades - stats_StrongTrend.wins) : 0;
       stats_StrongTrend.profitFactor = (stats_StrongTrend.totalLoss > 0) ? stats_StrongTrend.totalProfit / stats_StrongTrend.totalLoss : 0;
@@ -624,14 +634,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    {
       stats_WeakTrend.trades++;
       if(profit > 0)
-      {
-         stats_WeakTrend.wins++;
-         stats_WeakTrend.totalProfit += profit;
-      }
+      { stats_WeakTrend.wins++; stats_WeakTrend.totalProfit += profit; }
       else
-      {
-         stats_WeakTrend.totalLoss += MathAbs(profit);
-      }
+      { stats_WeakTrend.totalLoss += MathAbs(profit); }
       stats_WeakTrend.avgWin = (stats_WeakTrend.wins > 0) ? stats_WeakTrend.totalProfit / stats_WeakTrend.wins : 0;
       stats_WeakTrend.avgLoss = ((stats_WeakTrend.trades - stats_WeakTrend.wins) > 0) ? stats_WeakTrend.totalLoss / (stats_WeakTrend.trades - stats_WeakTrend.wins) : 0;
       stats_WeakTrend.profitFactor = (stats_WeakTrend.totalLoss > 0) ? stats_WeakTrend.totalProfit / stats_WeakTrend.totalLoss : 0;
@@ -640,48 +645,45 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    {
       stats_Ranging.trades++;
       if(profit > 0)
-      {
-         stats_Ranging.wins++;
-         stats_Ranging.totalProfit += profit;
-      }
+      { stats_Ranging.wins++; stats_Ranging.totalProfit += profit; }
       else
-      {
-         stats_Ranging.totalLoss += MathAbs(profit);
-      }
+      { stats_Ranging.totalLoss += MathAbs(profit); }
       stats_Ranging.avgWin = (stats_Ranging.wins > 0) ? stats_Ranging.totalProfit / stats_Ranging.wins : 0;
       stats_Ranging.avgLoss = ((stats_Ranging.trades - stats_Ranging.wins) > 0) ? stats_Ranging.totalLoss / (stats_Ranging.trades - stats_Ranging.wins) : 0;
       stats_Ranging.profitFactor = (stats_Ranging.totalLoss > 0) ? stats_Ranging.totalProfit / stats_Ranging.totalLoss : 0;
    }
 
-   if(profit < 0)
+   // Consecutive loss tracking (only on final close)
+   if(!isPartialClose)
    {
-      consecutiveLosses++;
-      lastLossTime = TimeCurrent();
-      Print("LOSS #", consecutiveLosses, ": $", DoubleToString(profit, 2),
-            " | R=", DoubleToString(rMultiple, 2),
-            " | Regime=", RegimeToString(tradeRegime),
-            " | Quality=", DoubleToString(quality, 2));
-   }
-   else if(profit > 0)
-   {
-      if(consecutiveLosses > 0)
-         Print("Win streak reset (was ", consecutiveLosses, " consecutive losses)");
-      consecutiveLosses = 0;
-      Print("WIN: $", DoubleToString(profit, 2),
-            " | R=", DoubleToString(rMultiple, 2),
-            " | MFE=", DoubleToString(mfe, _Digits),
-            " | MAE=", DoubleToString(mae, _Digits));
+      if(profit < 0)
+      {
+         consecutiveLosses++;
+         lastLossTime = TimeCurrent();
+         Print("LOSS #", consecutiveLosses, ": $", DoubleToString(profit, 2),
+               " | R=", DoubleToString(rMultiple, 2),
+               " | Regime=", RegimeToString(tradeRegime));
+      }
+      else if(profit > 0)
+      {
+         if(consecutiveLosses > 0)
+            Print("Win streak reset (was ", consecutiveLosses, " consecutive losses)");
+         consecutiveLosses = 0;
+         Print("WIN: $", DoubleToString(profit, 2),
+               " | R=", DoubleToString(rMultiple, 2),
+               " | MFE=", DoubleToString(mfe, _Digits),
+               " | MAE=", DoubleToString(mae, _Digits));
+      }
    }
 
    // Structured trade journal
-   double closePrice = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
-   Print("TRADE_JOURNAL|regime=", RegimeToString(tradeRegime),
+   Print("TRADE_JOURNAL|", (isPartialClose ? "PARTIAL|" : "FINAL|"),
+         "regime=", RegimeToString(tradeRegime),
          "|profit=", DoubleToString(profit, 2),
          "|rMultiple=", DoubleToString(rMultiple, 2),
          "|mae=", DoubleToString(mae, _Digits),
          "|mfe=", DoubleToString(mfe, _Digits),
          "|quality=", DoubleToString(quality, 2),
-         "|closePrice=", DoubleToString(closePrice, _Digits),
          "|posId=", posId);
 
    SaveState();
@@ -689,8 +691,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 
 //+------------------------------------------------------------------+
 //| REGIME DETECTION WITH HYSTERESIS                                   |
-//| Uses bar[1] (completed) to avoid look-ahead bias.                 |
-//| Requires N consecutive bars confirming before switching.           |
+//| v5.1: Eliminated UNKNOWN dead zone - HTF/MTF disagreement now     |
+//| classifies as WEAK_TREND instead of UNKNOWN                        |
 //+------------------------------------------------------------------+
 ENUM_REGIME DetectRegime()
 {
@@ -699,7 +701,7 @@ ENUM_REGIME DetectRegime()
    ArraySetAsSeries(adx_htf, true); ArraySetAsSeries(adx_mtf, true);
    ArraySetAsSeries(bb_upper, true); ArraySetAsSeries(bb_lower, true); ArraySetAsSeries(bb_mid, true);
 
-   int need = InpRegimeLookback + 1; // +1 so bar[1] has full lookback
+   int need = InpRegimeLookback + 1;
    if(CopyBuffer(h_ADX_HTF, 0, 0, need, adx_htf) < need) return currentRegime;
    if(CopyBuffer(h_ADX_MTF, 0, 0, need, adx_mtf) < need) return currentRegime;
    if(CopyBuffer(h_BB_MTF, 1, 0, need, bb_upper) < need) return currentRegime;
@@ -728,8 +730,8 @@ ENUM_REGIME DetectRegime()
             " ADX_M=", DoubleToString(adxMTF, 1),
             " BBW=", DoubleToString(bbWidth, 3));
 
-   // Raw classification
-   ENUM_REGIME rawRegime = REGIME_UNKNOWN;
+   // Raw classification - v5.1: No more UNKNOWN dead zones
+   ENUM_REGIME rawRegime;
    if(bbWidth > avgBBW * 2.0 && adxNow > InpADXStrongThresh)
       rawRegime = REGIME_VOLATILE;
    else if(adxNow >= InpADXStrongThresh)
@@ -737,6 +739,11 @@ ENUM_REGIME DetectRegime()
    else if(adxNow >= InpADXTrendThresh && adxMTF >= InpADXTrendThresh)
       rawRegime = REGIME_WEAK_TREND;
    else if(adxNow < InpADXTrendThresh && adxMTF < InpADXTrendThresh)
+      rawRegime = REGIME_RANGING;
+   // v5.1: When HTF/MTF ADX disagree (one trending, one not) -> WEAK_TREND
+   else if(adxNow >= InpADXTrendThresh || adxMTF >= InpADXTrendThresh)
+      rawRegime = REGIME_WEAK_TREND;
+   else
       rawRegime = REGIME_RANGING;
 
    // VOLATILE is immediate (safety override)
@@ -761,6 +768,7 @@ ENUM_REGIME DetectRegime()
 
 //+------------------------------------------------------------------+
 //| TREND DIRECTION - Multi-TF EMA (bar[1] only)                     |
+//| v5.1: Tier 3 granted to STRONG_TREND + Tier 4 EMA slope fallback |
 //+------------------------------------------------------------------+
 ENUM_TREND_DIR DetectTrendDirection()
 {
@@ -787,20 +795,37 @@ ENUM_TREND_DIR DetectTrendDirection()
    bool priceAbove = (close_htf[1] > emaSlow_H[1]);
    bool priceBelow = (close_htf[1] < emaSlow_H[1]);
 
+   // Tier 1: Full EMA fan + MTF confirmation (strongest)
    if(htfBull && mtfBull) return TREND_BULLISH;
    if(htfBear && mtfBear) return TREND_BEARISH;
+
+   // Tier 2: HTF fan + price position
    if(htfBull && priceAbove) return TREND_BULLISH;
    if(htfBear && priceBelow) return TREND_BEARISH;
-   if(currentRegime == REGIME_WEAK_TREND)
+
+   // Tier 3: Price position + MTF alignment (v5.1: now available for ALL trending regimes)
+   if(currentRegime == REGIME_STRONG_TREND || currentRegime == REGIME_WEAK_TREND)
    {
       if(priceAbove && mtfBull) return TREND_BULLISH;
       if(priceBelow && mtfBear) return TREND_BEARISH;
    }
+
+   // v5.1 Tier 4: EMA55 slope + price position (for STRONG_TREND during pullbacks)
+   if(currentRegime == REGIME_STRONG_TREND)
+   {
+      bool slowRising  = (emaSlow_H[1] > emaSlow_H[2]);
+      bool slowFalling = (emaSlow_H[1] < emaSlow_H[2]);
+      if(priceAbove && slowRising)  return TREND_BULLISH;
+      if(priceBelow && slowFalling) return TREND_BEARISH;
+   }
+
    return TREND_NEUTRAL;
 }
 
 //+------------------------------------------------------------------+
 //| TREND SIGNAL - Pullback entry (bar[1]/[2] only, no look-ahead)   |
+//| v5.1: Widened pullback zone, removed candle shape filter,         |
+//| expanded wasAbove/Below lookback to 3 bars                        |
 //+------------------------------------------------------------------+
 ENUM_SIGNAL GenerateTrendSignal()
 {
@@ -813,38 +838,36 @@ ENUM_SIGNAL GenerateTrendSignal()
    ArraySetAsSeries(close_m, true); ArraySetAsSeries(high_m, true);
    ArraySetAsSeries(low_m, true); ArraySetAsSeries(atr_m, true);
 
-   if(CopyBuffer(h_RSI_MTF, 0, 0, 4, rsi_mtf) < 4) return SIGNAL_NONE;
-   if(CopyBuffer(h_RSI_LTF, 0, 0, 4, rsi_ltf) < 4) return SIGNAL_NONE;
-   if(CopyBuffer(h_EMA_Fast_MTF, 0, 0, 4, emaFast_M) < 4) return SIGNAL_NONE;
-   if(CopyBuffer(h_EMA_Med_MTF, 0, 0, 4, emaMed_M) < 4) return SIGNAL_NONE;
-   if(CopyBuffer(h_ATR_MTF, 0, 0, 4, atr_m) < 4) return SIGNAL_NONE;
-   if(CopyClose(_Symbol, InpMTF, 0, 4, close_m) < 4) return SIGNAL_NONE;
-   if(CopyHigh(_Symbol, InpMTF, 0, 4, high_m)  < 4) return SIGNAL_NONE;
-   if(CopyLow(_Symbol, InpMTF, 0, 4, low_m)    < 4) return SIGNAL_NONE;
+   if(CopyBuffer(h_RSI_MTF, 0, 0, 5, rsi_mtf) < 5) return SIGNAL_NONE;
+   if(CopyBuffer(h_RSI_LTF, 0, 0, 5, rsi_ltf) < 5) return SIGNAL_NONE;
+   if(CopyBuffer(h_EMA_Fast_MTF, 0, 0, 5, emaFast_M) < 5) return SIGNAL_NONE;
+   if(CopyBuffer(h_EMA_Med_MTF, 0, 0, 5, emaMed_M) < 5) return SIGNAL_NONE;
+   if(CopyBuffer(h_ATR_MTF, 0, 0, 5, atr_m) < 5) return SIGNAL_NONE;
+   if(CopyClose(_Symbol, InpMTF, 0, 5, close_m) < 5) return SIGNAL_NONE;
+   if(CopyHigh(_Symbol, InpMTF, 0, 5, high_m)  < 5) return SIGNAL_NONE;
+   if(CopyLow(_Symbol, InpMTF, 0, 5, low_m)    < 5) return SIGNAL_NONE;
 
-   // ATR-based pullback zone (not fixed %)
-   // v5.1: Increased from 0.5 to 1.0 ATR for more signal opportunities
-   double pullbackATR = InpDiagnosticMode ? atr_m[2] * 1.5 : atr_m[2] * 1.0;
+   // v5.1: Widened pullback zone from 1.0 to 1.5 ATR
+   double pullbackATR = InpDiagnosticMode ? atr_m[2] * 2.0 : atr_m[2] * 1.5;
 
    // BULLISH: bar[2] pulled back near EMA21, bar[1] recovered
    if(currentTrend == TREND_BULLISH)
    {
       double zone = emaMed_M[2] + pullbackATR;
       bool pulledBack    = (low_m[2] <= zone);
-      bool wasAbove      = (close_m[3] > emaMed_M[3]);
+      // v5.1: Expanded lookback - was price above EMA21 in any of bars 2-4?
+      bool wasAbove      = (close_m[3] > emaMed_M[3]) || (close_m[4] > emaMed_M[4]);
       bool recovered     = (close_m[1] > close_m[2]);
       bool notOverbought = (rsi_mtf[1] < InpTrendRSIOB);
       bool rsiOK         = (rsi_ltf[1] > 40);
 
-      // v5: Momentum confirmation - price gaining strength
-      bool momentum = InpDiagnosticMode ? true : ((close_m[1] > close_m[2]) && ((close_m[1] - low_m[1]) > (high_m[1] - close_m[1]) * 0.7));
-
       if(InpVerboseLog)
          Print("T_BUY: pulled=", pulledBack, " above=", wasAbove,
-               " recov=", recovered, " !OB=", notOverbought, " rsi=", rsiOK, " mom=", momentum,
+               " recov=", recovered, " !OB=", notOverbought, " rsi=", rsiOK,
                (InpDiagnosticMode ? " [DIAG MODE]" : ""));
 
-      if(pulledBack && wasAbove && recovered && notOverbought && rsiOK && momentum)
+      // v5.1: Removed momentum candle shape filter (redundant with recovered, too restrictive)
+      if(pulledBack && wasAbove && recovered && notOverbought && rsiOK)
          return SIGNAL_BUY;
    }
 
@@ -853,27 +876,27 @@ ENUM_SIGNAL GenerateTrendSignal()
    {
       double zone = emaMed_M[2] - pullbackATR;
       bool pulledBack  = (high_m[2] >= zone);
-      bool wasBelow    = (close_m[3] < emaMed_M[3]);
+      // v5.1: Expanded lookback - was price below EMA21 in any of bars 2-4?
+      bool wasBelow    = (close_m[3] < emaMed_M[3]) || (close_m[4] < emaMed_M[4]);
       bool fell        = (close_m[1] < close_m[2]);
       bool notOversold = (rsi_mtf[1] > InpTrendRSIOS);
       bool rsiOK       = (rsi_ltf[1] < 60);
 
-      // v5: Momentum confirmation - price falling with strength
-      bool momentum = InpDiagnosticMode ? true : ((close_m[1] < close_m[2]) && ((high_m[1] - close_m[1]) > (close_m[1] - low_m[1]) * 0.7));
-
       if(InpVerboseLog)
          Print("T_SELL: pulled=", pulledBack, " below=", wasBelow,
-               " fell=", fell, " !OS=", notOversold, " rsi=", rsiOK, " mom=", momentum,
+               " fell=", fell, " !OS=", notOversold, " rsi=", rsiOK,
                (InpDiagnosticMode ? " [DIAG MODE]" : ""));
 
-      if(pulledBack && wasBelow && fell && notOversold && rsiOK && momentum)
+      // v5.1: Removed momentum candle shape filter
+      if(pulledBack && wasBelow && fell && notOversold && rsiOK)
          return SIGNAL_SELL;
    }
    return SIGNAL_NONE;
 }
 
 //+------------------------------------------------------------------+
-//| MEAN REVERSION SIGNAL (AND logic, bar[1]/[2], no look-ahead)     |
+//| MEAN REVERSION SIGNAL                                              |
+//| v5.1: Relaxed from AND(4) to BB_touch + OR(oscillator) + OR(turn)|
 //+------------------------------------------------------------------+
 ENUM_SIGNAL GenerateMeanReversionSignal()
 {
@@ -890,8 +913,8 @@ ENUM_SIGNAL GenerateMeanReversionSignal()
    if(CopyBuffer(h_Stoch_MTF, 1, 0, 4, stD) < 4) return SIGNAL_NONE;
    if(CopyClose(_Symbol, InpMTF, 0, 4, cl) < 4) return SIGNAL_NONE;
 
-   // BUY: bar[2] touched lower BB, bar[1] shows reversal (AND logic)
-   bool touchLow = (cl[2] <= bb_l[2] * 1.001);
+   // BUY: bar[2] touched lower BB, bar[1] shows reversal
+   bool touchLow = (cl[2] <= bb_l[2] * 1.002);  // v5.1: slightly wider tolerance
    if(touchLow)
    {
       bool rsiOS     = (rsi[2] < InpMR_RSI_OS);
@@ -899,16 +922,21 @@ ENUM_SIGNAL GenerateMeanReversionSignal()
       bool rsiTurn   = (rsi[1] > rsi[2]);
       bool stochTurn = (stK[1] > stK[2]);
 
+      // v5.1: Require BB touch + at least ONE oscillator extreme + at least ONE turning
+      bool hasExtreme = (rsiOS || stochOS);
+      bool hasTurn    = (rsiTurn || stochTurn);
+
       if(InpVerboseLog)
          Print("MR_BUY: rsiOS=", rsiOS, " stOS=", stochOS,
-               " rsiT=", rsiTurn, " stT=", stochTurn);
+               " rsiT=", rsiTurn, " stT=", stochTurn,
+               " | extreme=", hasExtreme, " turn=", hasTurn);
 
-      if(rsiOS && stochOS && rsiTurn && stochTurn)
+      if(hasExtreme && hasTurn)
          return SIGNAL_BUY;
    }
 
-   // SELL: bar[2] touched upper BB, bar[1] shows reversal (AND logic)
-   bool touchHi = (cl[2] >= bb_u[2] * 0.999);
+   // SELL: bar[2] touched upper BB, bar[1] shows reversal
+   bool touchHi = (cl[2] >= bb_u[2] * 0.998);  // v5.1: slightly wider tolerance
    if(touchHi)
    {
       bool rsiOB     = (rsi[2] > InpMR_RSI_OB);
@@ -916,11 +944,16 @@ ENUM_SIGNAL GenerateMeanReversionSignal()
       bool rsiFall   = (rsi[1] < rsi[2]);
       bool stochFall = (stK[1] < stK[2]);
 
+      // v5.1: Require BB touch + at least ONE oscillator extreme + at least ONE turning
+      bool hasExtreme = (rsiOB || stochOB);
+      bool hasTurn    = (rsiFall || stochFall);
+
       if(InpVerboseLog)
          Print("MR_SELL: rsiOB=", rsiOB, " stOB=", stochOB,
-               " rsiF=", rsiFall, " stF=", stochFall);
+               " rsiF=", rsiFall, " stF=", stochFall,
+               " | extreme=", hasExtreme, " turn=", hasTurn);
 
-      if(rsiOB && stochOB && rsiFall && stochFall)
+      if(hasExtreme && hasTurn)
          return SIGNAL_SELL;
    }
    return SIGNAL_NONE;
@@ -945,21 +978,21 @@ bool IsSpreadAcceptable()
    double costPct = (spread / expectedTP) * 100.0;
    double maxCost = (currentRegime == REGIME_RANGING) ? InpMaxSpreadCostMR : InpMaxSpreadCostPct;
 
-   // Diagnostic mode: relax spread filter
-   if(InpDiagnosticMode) maxCost *= 2.0; // Double the allowed spread in diagnostic mode
+   if(InpDiagnosticMode) maxCost *= 2.0;
 
    if(costPct > maxCost)
    {
       Print("SPREAD REJECT: cost=", DoubleToString(costPct, 1),
-            "% of TP > ", DoubleToString(maxCost, 0), "%",
-            (InpDiagnosticMode ? " [DIAG MODE]" : ""));
+            "% of TP > ", DoubleToString(maxCost, 0), "%");
       return false;
    }
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| v5: TRADE QUALITY SCORING (0-1 scale)                            |
+//| TRADE QUALITY SCORING (0-1 scale)                                |
+//| v5.1: Uses bar[1] for ATR, session-aware bonus instead of        |
+//| hardcoded hours                                                    |
 //+------------------------------------------------------------------+
 double CalculateTradeQuality(ENUM_SIGNAL signal)
 {
@@ -979,8 +1012,8 @@ double CalculateTradeQuality(ENUM_SIGNAL signal)
    // 2. RSI positioning (0-0.15 points)
    if(signal == SIGNAL_BUY)
    {
-      if(rsi[1] > 40 && rsi[1] < 60) score += 0.15; // Sweet spot
-      else if(rsi[1] < 40) score += 0.10; // Oversold but not extreme
+      if(rsi[1] > 40 && rsi[1] < 60) score += 0.15;
+      else if(rsi[1] < 40) score += 0.10;
    }
    else
    {
@@ -988,38 +1021,41 @@ double CalculateTradeQuality(ENUM_SIGNAL signal)
       else if(rsi[1] > 60) score += 0.10;
    }
 
-   // 3. Volatility stability (0-0.10 points)
+   // 3. Volatility stability (0-0.10 points) - v5.1: use bar[1] to avoid look-ahead
    double avgATR = 0;
-   for(int i = 0; i < 10; i++) avgATR += atr[i];  // Fixed: was accessing index 10 (out of bounds)
-   avgATR /= 10;
+   for(int i = 1; i <= 9; i++) avgATR += atr[i];
+   avgATR /= 9;
    double atrRatio = (avgATR > 0) ? atr[1] / avgATR : 1.0;
-   if(atrRatio > 0.8 && atrRatio < 1.3) score += 0.10; // Stable volatility
+   if(atrRatio > 0.8 && atrRatio < 1.3) score += 0.10;
 
    // 4. Regime confidence (0-0.10 points)
    if(regimeConfirmCount >= InpRegimeConfirmBars) score += 0.10;
 
-   // 5. Time of day quality (0-0.10 points)
+   // 5. Session awareness (0-0.10 points) - v5.1: uses session filter config
    MqlDateTime dt; TimeCurrent(dt);
-   if((dt.hour >= 8 && dt.hour <= 12) || (dt.hour >= 14 && dt.hour <= 17))
-      score += 0.10; // Best trading hours
+   if(dt.hour >= InpSessionStartHour && dt.hour < InpSessionEndHour)
+      score += 0.05;
+   // Bonus for overlap hours (typically highest liquidity)
+   if(dt.hour >= 13 && dt.hour <= 16)
+      score += 0.05;
 
    return MathMin(score, 1.0);
 }
 
 //+------------------------------------------------------------------+
-//| v5: EXPECTED VALUE CHECK                                          |
+//| EXPECTED VALUE CHECK                                              |
+//| v5.1: Re-enabled as blocking filter with corrected inputs         |
+//| (entry ATR, no partial close contamination, stable alpha)          |
 //+------------------------------------------------------------------+
 bool IsPositiveExpectedValue(double riskAmt, double atrDist)
 {
-   // Need sufficient sample size before filtering on EV (matches Kelly threshold)
-   if(totalClosedTrades < 20) return true;
+   // v5.1: Need 30 trades for stable estimates (up from 20)
+   if(totalClosedTrades < 30) return true;
 
-   // Calculate expected value in dollars
    double avgWinDollars = riskAmt * historicalAvgWin;
    double avgLossDollars = riskAmt * historicalAvgLoss;
 
    double ev = (historicalWinRate * avgWinDollars) - ((1.0 - historicalWinRate) * avgLossDollars);
-   // Note: spread cost NOT deducted here - already filtered by IsSpreadAcceptable()
 
    if(InpVerboseLog && ev <= 0)
       Print("NEGATIVE EV: $", DoubleToString(ev, 2),
@@ -1033,11 +1069,13 @@ bool IsPositiveExpectedValue(double riskAmt, double atrDist)
 
 //+------------------------------------------------------------------+
 //| POST-LOSS COOLDOWN                                                |
+//| v5.1: Capped multiplier at 2x (was 3x - too aggressive)          |
 //+------------------------------------------------------------------+
 bool IsCooldownActive()
 {
    if(consecutiveLosses < 2) return false;
-   int mult = (consecutiveLosses >= InpMaxConsecLosses) ? 3 : 1;
+   // v5.1: Cap at 2x (was 3x - 15 bars was too long, missed recovery moves)
+   int mult = (consecutiveLosses >= InpMaxConsecLosses) ? 2 : 1;
    int bars = InpCooldownBars * mult;
    if(lastLossTime > 0)
    {
@@ -1055,7 +1093,8 @@ bool IsCooldownActive()
 }
 
 //+------------------------------------------------------------------+
-//| EXECUTE TRADE with retry logic + v5 enhancements                  |
+//| EXECUTE TRADE with retry logic                                     |
+//| v5.1: Kelly negative -> reduce risk, EV blocking re-enabled       |
 //+------------------------------------------------------------------+
 void ExecuteTrade(ENUM_SIGNAL signal, double qualityScore = 0.7)
 {
@@ -1082,14 +1121,11 @@ void ExecuteTrade(ENUM_SIGNAL signal, double qualityScore = 0.7)
    double minStop = stopsLvl * _Point;
    if(slDist < minStop && minStop > 0) slDist = minStop * 1.1;
 
-   // v5: REMOVED regime-based size scaling (destroyed expectancy)
-   // v5: Use Kelly Criterion if enabled
+   // Kelly Criterion position sizing
    double adjRisk = InpRiskPercent;
 
-   if(InpUseKellyCriterion && totalClosedTrades >= 20)
+   if(InpUseKellyCriterion && totalClosedTrades >= 30)
    {
-      // Kelly Formula: f = (p*b - q) / b
-      // where p = win rate, q = 1-p, b = avg_win / avg_loss
       double p = historicalWinRate;
       double q = 1.0 - p;
       double b = (historicalAvgLoss > 0) ? historicalAvgWin / historicalAvgLoss : 2.0;
@@ -1097,27 +1133,38 @@ void ExecuteTrade(ENUM_SIGNAL signal, double qualityScore = 0.7)
       double kellyPct = (p * b - q) / b;
       if(kellyPct > 0)
       {
-         adjRisk = kellyPct * 100.0 * InpKellyFraction; // Apply safety fraction
+         adjRisk = kellyPct * 100.0 * InpKellyFraction;
          adjRisk = MathMin(adjRisk, InpRiskPercent * 1.5); // Cap at 1.5x base
-         adjRisk = MathMax(adjRisk, InpRiskPercent * 0.5); // Floor at 0.5x base
+         // v5.1: Removed 0.5x floor - let Kelly size down properly
+         adjRisk = MathMax(adjRisk, InpRiskPercent * 0.1);  // Minimum 10% of base
 
          if(InpVerboseLog)
             Print("Kelly: WR=", DoubleToString(p*100,1), "% b=", DoubleToString(b,2),
                   " kelly=", DoubleToString(kellyPct*100,1), "% adj=", DoubleToString(adjRisk,2), "%");
+      }
+      else
+      {
+         // v5.1: Negative Kelly = no edge detected -> reduce to minimum
+         adjRisk = InpRiskPercent * 0.25;
+         if(InpVerboseLog)
+            Print("Kelly NEGATIVE: WR=", DoubleToString(p*100,1), "% b=", DoubleToString(b,2),
+                  " -> reduced to ", DoubleToString(adjRisk,2), "%");
       }
    }
 
    double lotSize = CalcLots(slDist, adjRisk);
    if(lotSize <= 0) return;
 
-   // v5: Expected Value advisory (logged only, not blocking - Kelly handles sizing)
+   // v5.1: EV check re-enabled as blocking filter (inputs now corrected)
    double riskAmt = accInfo.Balance() * adjRisk / 100.0;
    if(!IsPositiveExpectedValue(riskAmt, slDist))
    {
-      Print("EV WARNING: Negative expected value (advisory only)");
+      Print("SKIP: Negative expected value (WR=", DoubleToString(historicalWinRate*100,1),
+            "% trades=", totalClosedTrades, ")");
+      return;
    }
 
-   // MinLot safety: skip if minLot exceeds 1.5x risk budget
+   // MinLot safety
    double minLot = symInfo.LotsMin();
    if(lotSize <= minLot)
    {
@@ -1157,7 +1204,7 @@ void ExecuteTrade(ENUM_SIGNAL signal, double qualityScore = 0.7)
          tradesToday++;
          ulong ticket = trade.ResultOrder();
          Print("SUCCESS: ticket=", ticket);
-         AddTradeRecord(ticket, currentRegime, signal, entry, qualityScore);
+         AddTradeRecord(ticket, currentRegime, signal, entry, qualityScore, atr);
          SaveState();
          return;
       }
@@ -1196,17 +1243,12 @@ double CalcLots(double slDist, double riskPct)
 }
 
 //+------------------------------------------------------------------+
-//| MANAGE POSITIONS (ATR hoisted, time-exit first, checked results)  |
+//| MANAGE POSITIONS                                                   |
+//| v5.1: Uses entry ATR + entry regime, skips redundant BE           |
 //+------------------------------------------------------------------+
 void ManageOpenPositions()
 {
    PruneTracker();
-
-   double atr_v[];
-   ArraySetAsSeries(atr_v, true);
-   if(CopyBuffer(h_ATR_MTF, 0, 0, 1, atr_v) < 1) return;
-   double atr = atr_v[0];
-   if(atr <= 0) return;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -1221,17 +1263,32 @@ void ManageOpenPositions()
       double curPrice = (pType == POSITION_TYPE_BUY) ? symInfo.Bid() : symInfo.Ask();
       double dist = (pType == POSITION_TYPE_BUY) ? (curPrice - openP) : (openP - curPrice);
 
-      // v5: Track MAE/MFE for analytics
+      // v5.1: Look up entry ATR and entry regime from tracker
+      double entryAtr = 0;
+      ENUM_REGIME entryRegime = REGIME_UNKNOWN;
       for(int t = 0; t < ArraySize(activeTracker); t++)
       {
          if(activeTracker[t].ticket == ticket)
          {
+            entryAtr = activeTracker[t].entryATR;
+            entryRegime = activeTracker[t].regime;
+            // Track MAE/MFE
             double mae = (pType == POSITION_TYPE_BUY) ? (openP - curPrice) : (curPrice - openP);
             double mfe = dist;
             if(mae > activeTracker[t].maxMAE) activeTracker[t].maxMAE = mae;
             if(mfe > activeTracker[t].maxMFE) activeTracker[t].maxMFE = mfe;
             break;
          }
+      }
+
+      // Fallback: if entry ATR not found, use current ATR
+      if(entryAtr <= 0)
+      {
+         double atr_v[];
+         ArraySetAsSeries(atr_v, true);
+         if(CopyBuffer(h_ATR_MTF, 0, 0, 1, atr_v) >= 1)
+            entryAtr = atr_v[0];
+         if(entryAtr <= 0) continue;
       }
 
       // 1. TIME EXIT (first - if closing, skip rest)
@@ -1248,14 +1305,14 @@ void ManageOpenPositions()
          }
       }
 
-      // 2. PARTIAL CLOSE - v5: Only in STRONG_TREND if filter enabled
+      // 2. PARTIAL CLOSE - v5.1: Uses ENTRY regime, not current regime
       if(InpUsePartialClose && !IsPartialDone(ticket))
       {
          bool allowPartial = true;
-         if(InpPartialOnlyStrong && currentRegime != REGIME_STRONG_TREND)
+         if(InpPartialOnlyStrong && entryRegime != REGIME_STRONG_TREND)
             allowPartial = false;
 
-         if(allowPartial && dist >= atr * InpPartialCloseATR)
+         if(allowPartial && dist >= entryAtr * InpPartialCloseATR)
          {
             double cLots = NormalizeDouble(posInfo.Volume() * InpPartialClosePct / 100.0, 2);
             double ml = symInfo.LotsMin();
@@ -1265,16 +1322,19 @@ void ManageOpenPositions()
             if(cLots < posInfo.Volume() && (posInfo.Volume() - cLots) >= ml)
             {
                if(trade.PositionClosePartial(ticket, cLots))
-               { MarkPartialDone(ticket); Print("Partial: #", ticket, " ", cLots, " lots at +", DoubleToString(dist/atr, 2), "R"); }
+               { MarkPartialDone(ticket); Print("Partial: #", ticket, " ", cLots, " lots at +", DoubleToString(dist/entryAtr, 2), "R"); }
             }
             else MarkPartialDone(ticket);
          }
       }
 
-      // 3. BREAK-EVEN
-      if(InpUseBreakEven && dist >= atr * InpBreakEvenATR)
+      // v5.1: Determine if trailing will also fire (avoid redundant BE modify)
+      bool trailingWillFire = (InpUseTrailingStop && dist >= entryAtr * InpTrailActivateATR);
+
+      // 3. BREAK-EVEN - v5.1: Skip if trailing stop will also fire on this tick
+      if(InpUseBreakEven && !trailingWillFire && dist >= entryAtr * InpBreakEvenATR)
       {
-         double beOff = atr * InpBreakEvenOffset;
+         double beOff = entryAtr * InpBreakEvenOffset;
          double newSL;
          bool mod = false;
          if(pType == POSITION_TYPE_BUY)
@@ -1284,22 +1344,21 @@ void ManageOpenPositions()
          if(mod)
          {
             if(trade.PositionModify(ticket, newSL, curTP))
-               curSL = newSL; // update for trailing below
+               curSL = newSL;
          }
       }
 
-      // 4. TRAILING STOP - v5: Dynamic based on profit level
-      if(InpUseTrailingStop && dist >= atr * InpTrailActivateATR)
+      // 4. TRAILING STOP - Dynamic based on profit level, uses entry ATR
+      if(trailingWillFire)
       {
-         double trDist = atr * InpTrailATRMult;
-         double rMultiple = dist / atr;
+         double trDist = entryAtr * InpTrailATRMult;
+         double rMultiple = dist / entryAtr;
 
-         // v5: Dynamic trailing - tighter as profit increases
          if(InpUseDynamicTrail)
          {
-            if(rMultiple >= 3.0)      trDist = atr * 0.5;  // Very tight at 3R+
-            else if(rMultiple >= 2.0) trDist = atr * 0.75; // Tight at 2R+
-            else if(rMultiple >= 1.5) trDist = atr * 1.0;  // Normal at 1.5R+
+            if(rMultiple >= 3.0)      trDist = entryAtr * 0.5;
+            else if(rMultiple >= 2.0) trDist = entryAtr * 0.75;
+            else if(rMultiple >= 1.5) trDist = entryAtr * 1.0;
          }
 
          double newSL;
@@ -1457,9 +1516,10 @@ double GetTotalRiskPercent()
 }
 
 //+------------------------------------------------------------------+
-//| TRADE RECORD TRACKER WITH GC + v5 analytics                      |
+//| TRADE RECORD TRACKER WITH GC                                      |
+//| v5.1: Now stores entry ATR for consistent management/R-multiples  |
 //+------------------------------------------------------------------+
-void AddTradeRecord(ulong ticket, ENUM_REGIME regime, ENUM_SIGNAL dir, double openP, double quality = 0.7)
+void AddTradeRecord(ulong ticket, ENUM_REGIME regime, ENUM_SIGNAL dir, double openP, double quality, double atr)
 {
    int s = ArraySize(activeTracker);
    ArrayResize(activeTracker, s + 1, 16);
@@ -1469,6 +1529,7 @@ void AddTradeRecord(ulong ticket, ENUM_REGIME regime, ENUM_SIGNAL dir, double op
    activeTracker[s].direction   = dir;
    activeTracker[s].openPrice   = openP;
    activeTracker[s].openTime    = TimeCurrent();
+   activeTracker[s].entryATR    = atr;
    activeTracker[s].maxMAE      = 0;
    activeTracker[s].maxMFE      = 0;
    activeTracker[s].qualityScore = quality;
@@ -1524,14 +1585,14 @@ string TrendToString(ENUM_TREND_DIR t)
 }
 
 //+------------------------------------------------------------------+
-//| v5: ENHANCED DASHBOARD WITH ANALYTICS                             |
+//| ENHANCED DASHBOARD WITH ANALYTICS                                  |
 //+------------------------------------------------------------------+
 void DrawDashboard()
 {
    int x = 10, y = 30, lh = 16;
    string p = "AREA_";
 
-   DL(p+"t", x, y, "=== ADAPTIVE REGIME EA v5.0 ===", clrGold, 10); y += lh+3;
+   DL(p+"t", x, y, "=== ADAPTIVE REGIME EA v5.1 ===", clrGold, 10); y += lh+3;
 
    double bal = accInfo.Balance(), eq = accInfo.Equity();
    double dd = (peakBalance > 0) ? (peakBalance - eq) / peakBalance * 100.0 : 0;
@@ -1559,8 +1620,8 @@ void DrawDashboard()
    DL(p+"p", x, y, StringFormat("Pos: %d/%d | Risk: %.1f%% | ConLoss: %d",
       cachedPosCount, InpMaxPositions, cachedTotalRisk, consecutiveLosses), InpDashText, 8); y += lh+3;
 
-   // v5: Kelly Criterion Stats
-   if(totalClosedTrades >= 20)
+   // Kelly Criterion Stats
+   if(totalClosedTrades >= 30)
    {
       double kellyPct = 0;
       double p_win = historicalWinRate;
@@ -1574,11 +1635,11 @@ void DrawDashboard()
    }
    else
    {
-      DL(p+"kelly", x, y, StringFormat("Kelly: %d/20 trades (learning...)", totalClosedTrades),
+      DL(p+"kelly", x, y, StringFormat("Kelly: %d/30 trades (learning...)", totalClosedTrades),
          clrGray, 8); y += lh;
    }
 
-   // v5: Regime Performance Breakdown
+   // Regime Performance Breakdown
    y += 3;
    DL(p+"perfhdr", x, y, "REGIME PERFORMANCE:", clrGold, 9); y += lh;
 
@@ -1587,7 +1648,7 @@ void DrawDashboard()
       double wr = (double)stats_StrongTrend.wins / stats_StrongTrend.trades * 100;
       DL(p+"st", x, y, StringFormat("  Strong: %d/%d (%.0f%%) PF=%.2f",
          stats_StrongTrend.wins, stats_StrongTrend.trades, wr, stats_StrongTrend.profitFactor),
-         (wr >= 60) ? clrLimeGreen : clrOrange, 8); y += lh;
+         (wr >= 50) ? clrLimeGreen : clrOrange, 8); y += lh;
    }
 
    if(stats_WeakTrend.trades > 0)
@@ -1595,7 +1656,7 @@ void DrawDashboard()
       double wr = (double)stats_WeakTrend.wins / stats_WeakTrend.trades * 100;
       DL(p+"wt", x, y, StringFormat("  Weak: %d/%d (%.0f%%) PF=%.2f",
          stats_WeakTrend.wins, stats_WeakTrend.trades, wr, stats_WeakTrend.profitFactor),
-         (wr >= 60) ? clrLimeGreen : clrOrange, 8); y += lh;
+         (wr >= 50) ? clrLimeGreen : clrOrange, 8); y += lh;
    }
 
    if(stats_Ranging.trades > 0)
@@ -1603,7 +1664,7 @@ void DrawDashboard()
       double wr = (double)stats_Ranging.wins / stats_Ranging.trades * 100;
       DL(p+"rg", x, y, StringFormat("  Range: %d/%d (%.0f%%) PF=%.2f",
          stats_Ranging.wins, stats_Ranging.trades, wr, stats_Ranging.profitFactor),
-         (wr >= 60) ? clrLimeGreen : clrOrange, 8); y += lh;
+         (wr >= 50) ? clrLimeGreen : clrOrange, 8); y += lh;
    }
 
    y += 3;
