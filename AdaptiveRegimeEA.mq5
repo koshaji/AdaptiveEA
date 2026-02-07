@@ -824,8 +824,8 @@ ENUM_TREND_DIR DetectTrendDirection()
 
 //+------------------------------------------------------------------+
 //| TREND SIGNAL - Pullback entry (bar[1]/[2] only, no look-ahead)   |
-//| v5.1: Widened pullback zone, removed candle shape filter,         |
-//| expanded wasAbove/Below lookback to 3 bars                        |
+//| v5.2: Extended wasAbove/Below lookback to bars 2-6 (was 3-4),    |
+//| lowered rsiOK buy threshold to 35, raised sell to 65              |
 //+------------------------------------------------------------------+
 ENUM_SIGNAL GenerateTrendSignal()
 {
@@ -838,14 +838,14 @@ ENUM_SIGNAL GenerateTrendSignal()
    ArraySetAsSeries(close_m, true); ArraySetAsSeries(high_m, true);
    ArraySetAsSeries(low_m, true); ArraySetAsSeries(atr_m, true);
 
-   if(CopyBuffer(h_RSI_MTF, 0, 0, 5, rsi_mtf) < 5) return SIGNAL_NONE;
-   if(CopyBuffer(h_RSI_LTF, 0, 0, 5, rsi_ltf) < 5) return SIGNAL_NONE;
-   if(CopyBuffer(h_EMA_Fast_MTF, 0, 0, 5, emaFast_M) < 5) return SIGNAL_NONE;
-   if(CopyBuffer(h_EMA_Med_MTF, 0, 0, 5, emaMed_M) < 5) return SIGNAL_NONE;
-   if(CopyBuffer(h_ATR_MTF, 0, 0, 5, atr_m) < 5) return SIGNAL_NONE;
-   if(CopyClose(_Symbol, InpMTF, 0, 5, close_m) < 5) return SIGNAL_NONE;
-   if(CopyHigh(_Symbol, InpMTF, 0, 5, high_m)  < 5) return SIGNAL_NONE;
-   if(CopyLow(_Symbol, InpMTF, 0, 5, low_m)    < 5) return SIGNAL_NONE;
+   if(CopyBuffer(h_RSI_MTF, 0, 0, 8, rsi_mtf) < 8) return SIGNAL_NONE;
+   if(CopyBuffer(h_RSI_LTF, 0, 0, 8, rsi_ltf) < 8) return SIGNAL_NONE;
+   if(CopyBuffer(h_EMA_Fast_MTF, 0, 0, 8, emaFast_M) < 8) return SIGNAL_NONE;
+   if(CopyBuffer(h_EMA_Med_MTF, 0, 0, 8, emaMed_M) < 8) return SIGNAL_NONE;
+   if(CopyBuffer(h_ATR_MTF, 0, 0, 8, atr_m) < 8) return SIGNAL_NONE;
+   if(CopyClose(_Symbol, InpMTF, 0, 8, close_m) < 8) return SIGNAL_NONE;
+   if(CopyHigh(_Symbol, InpMTF, 0, 8, high_m)  < 8) return SIGNAL_NONE;
+   if(CopyLow(_Symbol, InpMTF, 0, 8, low_m)    < 8) return SIGNAL_NONE;
 
    // v5.1: Widened pullback zone from 1.0 to 1.5 ATR
    double pullbackATR = InpDiagnosticMode ? atr_m[2] * 2.0 : atr_m[2] * 1.5;
@@ -855,11 +855,14 @@ ENUM_SIGNAL GenerateTrendSignal()
    {
       double zone = emaMed_M[2] + pullbackATR;
       bool pulledBack    = (low_m[2] <= zone);
-      // v5.1: Expanded lookback - was price above EMA21 in any of bars 2-4?
-      bool wasAbove      = (close_m[3] > emaMed_M[3]) || (close_m[4] > emaMed_M[4]);
+      // v5.2: Extended lookback to bars 2-6 (was 3-4) to survive multi-bar pullbacks
+      bool wasAbove      = (close_m[2] > emaMed_M[2]) || (close_m[3] > emaMed_M[3])
+                        || (close_m[4] > emaMed_M[4]) || (close_m[5] > emaMed_M[5])
+                        || (close_m[6] > emaMed_M[6]);
       bool recovered     = (close_m[1] > close_m[2]);
       bool notOverbought = (rsi_mtf[1] < InpTrendRSIOB);
-      bool rsiOK         = (rsi_ltf[1] > 40);
+      // v5.2: Lowered from 40 to 35 (RSI 35-40 during pullback is a buy signal, not a reject)
+      bool rsiOK         = (rsi_ltf[1] > 35);
 
       if(InpVerboseLog)
          Print("T_BUY: pulled=", pulledBack, " above=", wasAbove,
@@ -876,11 +879,14 @@ ENUM_SIGNAL GenerateTrendSignal()
    {
       double zone = emaMed_M[2] - pullbackATR;
       bool pulledBack  = (high_m[2] >= zone);
-      // v5.1: Expanded lookback - was price below EMA21 in any of bars 2-4?
-      bool wasBelow    = (close_m[3] < emaMed_M[3]) || (close_m[4] < emaMed_M[4]);
+      // v5.2: Extended lookback to bars 2-6 (was 3-4) to survive multi-bar pullbacks
+      bool wasBelow    = (close_m[2] < emaMed_M[2]) || (close_m[3] < emaMed_M[3])
+                      || (close_m[4] < emaMed_M[4]) || (close_m[5] < emaMed_M[5])
+                      || (close_m[6] < emaMed_M[6]);
       bool fell        = (close_m[1] < close_m[2]);
       bool notOversold = (rsi_mtf[1] > InpTrendRSIOS);
-      bool rsiOK       = (rsi_ltf[1] < 60);
+      // v5.2: Raised from 60 to 65 (RSI 60-65 during pullback is a sell signal, not a reject)
+      bool rsiOK       = (rsi_ltf[1] < 65);
 
       if(InpVerboseLog)
          Print("T_SELL: pulled=", pulledBack, " below=", wasBelow,
