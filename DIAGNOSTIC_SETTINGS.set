@@ -1,0 +1,100 @@
+; AdaptiveRegimeEA v5.0 - DIAGNOSTIC SETTINGS
+; Use these settings to troubleshoot "zero trades" issue
+; Copy these into EA parameters when attaching to chart
+
+[General Settings]
+InpMagicNumber=247901
+InpTradeComment=AREA
+InpHTF=16408          ; H4
+InpMTF=16385          ; H1
+InpLTF=3              ; M15
+InpVerboseLog=true    ; CRITICAL: Enable detailed logging
+InpDiagnosticMode=true ; CRITICAL: Relax filters for testing
+
+[Regime Detection]
+InpADXPeriod=14
+InpADXTrendThresh=18.0     ; RELAXED from 20.0 (more signals)
+InpADXStrongThresh=35.0
+InpBBPeriod=20
+InpBBDeviation=2.0
+InpRegimeLookback=20
+InpRegimeConfirmBars=1     ; Already optimal
+
+[Trend Following]
+InpFastEMA=8
+InpMedEMA=21
+InpSlowEMA=55
+InpTrendRSIPeriod=14
+InpTrendRSIOB=70.0
+InpTrendRSIOS=30.0
+
+[Mean Reversion]
+InpMR_RSIPeriod=7
+InpMR_RSI_OB=75.0
+InpMR_RSI_OS=25.0
+InpMR_StochK=14
+InpMR_StochD=3
+InpMR_StochSlow=3
+InpMR_StochOB=75.0         ; RELAXED from 80.0
+InpMR_StochOS=25.0         ; RELAXED from 20.0
+
+[Risk Management]
+InpRiskPercent=1.0
+InpMaxRiskPercent=3.0
+InpATRMultSL=1.5
+InpATRMultTP=4.5           ; 3:1 ratio
+InpMR_ATRSL=1.0
+InpMR_ATRTP=2.0            ; 2:1 ratio
+InpMaxDrawdownPct=10.0
+InpMaxDailyLossPct=3.0
+InpMaxConsecLosses=3
+InpCooldownBars=5
+InpATRPeriod=14
+InpUseKellyCriterion=true
+InpKellyFraction=0.25
+InpMaxRiskPercent=3.0
+
+[Trade Management]
+InpMaxPositions=3
+InpMaxTradesPerDay=8
+InpUsePartialClose=true
+InpPartialClosePct=30.0
+InpPartialCloseATR=2.5
+InpPartialOnlyStrong=true
+InpUseTrailingStop=true
+InpUseDynamicTrail=true
+InpTrailATRMult=1.0
+InpUseBreakEven=true
+InpBreakEvenATR=0.8
+InpMaxHoldBars=100
+
+[Filters]
+InpMaxSpreadCostPct=7.0    ; RELAXED from 5.0 (diagnostic mode doubles this to 14%)
+InpMaxSpreadCostMR=4.0     ; RELAXED from 3.0 (diagnostic mode doubles this to 8%)
+InpMinTradeQuality=0.50    ; RELAXED from 0.60 (diagnostic mode lowers to 0.45)
+InpUseSessionFilter=false  ; DISABLED for testing (enable after signals confirmed)
+InpSessionStartHour=0
+InpSessionEndHour=23
+
+[Display]
+InpShowDashboard=true
+
+; EXPECTED BEHAVIOR WITH THESE SETTINGS:
+; - Diagnostic mode relaxes momentum check, quality threshold, and spread filter
+; - Should see 2-4 signals per week on EURUSD H1
+; - Verbose logging will show exactly why signals are/aren't generated
+; - Check "Experts" tab in MT5 Terminal for detailed logs
+;
+; WHAT TO MONITOR:
+; - "--- NEW BAR" messages (every hour on H1)
+; - "STATE: Regime=X | Trend=Y" messages
+; - "T_BUY:" or "T_SELL:" or "MR_BUY:" or "MR_SELL:" messages showing signal evaluation
+; - ">>> SIGNAL:" messages when trade is executed
+; - "BLOCKED:" messages showing which filter rejected
+;
+; AFTER SIGNALS CONFIRMED WORKING:
+; 1. Set InpDiagnosticMode=false
+; 2. Increase InpMinTradeQuality=0.60
+; 3. Decrease InpMaxSpreadCostPct=5.0
+; 4. Set InpADXTrendThresh=20.0
+; 5. Enable session filter if desired

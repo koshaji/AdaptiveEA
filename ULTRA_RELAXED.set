@@ -1,0 +1,87 @@
+; AdaptiveRegimeEA v5.0 - ULTRA RELAXED SETTINGS
+; For immediate signal generation and diagnostic testing
+; Expected: 4-8 signals per week on EURUSD H1
+
+[General Settings]
+InpMagicNumber=247901
+InpTradeComment=AREA_DIAG
+InpHTF=16408
+InpMTF=16385
+InpLTF=3
+InpVerboseLog=true
+InpDiagnosticMode=true
+
+[Regime Detection]
+InpADXPeriod=14
+InpADXTrendThresh=15.0
+InpADXStrongThresh=30.0
+InpBBPeriod=20
+InpBBDeviation=2.0
+InpRegimeLookback=20
+InpRegimeConfirmBars=1
+
+[Trend Following]
+InpFastEMA=8
+InpMedEMA=21
+InpSlowEMA=55
+InpTrendRSIPeriod=14
+InpTrendRSIOB=70.0
+InpTrendRSIOS=30.0
+
+[Mean Reversion]
+InpMR_RSIPeriod=7
+InpMR_RSI_OB=70.0
+InpMR_RSI_OS=30.0
+InpMR_StochK=14
+InpMR_StochD=3
+InpMR_StochSlow=3
+InpMR_StochOB=70.0
+InpMR_StochOS=30.0
+
+[Risk Management]
+InpRiskPercent=0.5
+InpMaxRiskPercent=3.0
+InpATRMultSL=1.5
+InpATRMultTP=4.5
+InpMR_ATRSL=1.0
+InpMR_ATRTP=2.0
+InpATRPeriod=14
+InpMaxDailyLossPct=3.0
+InpMaxDrawdownPct=10.0
+InpMaxPositions=5
+InpMaxTradesPerDay=20
+InpUseKellyCriterion=false
+InpKellyFraction=0.25
+
+[Filters]
+InpMaxSpreadCostPct=10.0
+InpMaxSpreadCostMR=6.0
+InpCooldownBars=5
+InpMaxConsecLosses=3
+InpMinTradeQuality=0.45
+
+[Trade Management]
+InpUsePartialClose=false
+InpPartialClosePct=30.0
+InpPartialCloseATR=2.5
+InpPartialOnlyStrong=true
+InpUseTrailingStop=true
+InpTrailATRMult=1.0
+InpTrailActivateATR=1.5
+InpUseDynamicTrail=false
+InpUseBreakEven=true
+InpBreakEvenATR=0.8
+InpBreakEvenOffset=0.3
+InpMaxHoldBars=100
+
+[Session Filter]
+InpUseSessionFilter=false
+InpSessionStartHour=0
+InpSessionEndHour=23
+InpAvoidFriday=false
+InpFridayCutoffHour=18
+
+[Display]
+InpShowDashboard=true
+InpDashText=14474460
+InpDashBG=2105376
