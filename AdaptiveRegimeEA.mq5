@@ -1909,6 +1909,11 @@ void CheckNewDay()
       dailyStartBalance = accInfo.Balance();
       tradesToday = 0;
       dailyLossLimitHit = false;
+      // Reset circuit breaker and peak on new day so DD measurement starts fresh
+      if(circuitBreakerActive)
+         Print("Circuit breaker RESET on new day (was active)");
+      circuitBreakerActive = false;
+      peakBalance = accInfo.Balance();
       Print("New day: ", TimeToString(today, TIME_DATE),
             " | Balance: ", DoubleToString(dailyStartBalance, 2));
       SaveState();
