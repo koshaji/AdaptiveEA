@@ -1,29 +1,32 @@
 //+------------------------------------------------------------------+
 //|                                          AdaptiveRegimeEA.mq5    |
 //|                        Adaptive Market Regime Expert Advisor      |
-//|                           v5.1 - Expert-Reviewed Overhaul         |
+//|                           v6.0 - High Return-to-Risk Overhaul     |
 //|                                                                    |
-//|  v5.1 Changes (Expert Panel Review - All Critical Fixes):         |
-//|  [CRITICAL] Fixed death spiral: EV blocking re-enabled properly   |
-//|  [CRITICAL] Fixed GlobalVariable leak into Strategy Tester        |
-//|  [CRITICAL] Fixed partial close double-counting in Kelly stats    |
-//|  [CRITICAL] Fixed R-multiple uses entry ATR, not close-time ATR   |
-//|  [CRITICAL] Fixed EMA alpha destroys bootstrap on first trade     |
-//|  [HIGH]     Eliminated UNKNOWN regime dead zone (20-35% recovery) |
-//|  [HIGH]     Fixed STRONG_TREND + NEUTRAL paradox (Tier 3+4)       |
-//|  [HIGH]     Negative Kelly now reduces risk instead of ignoring   |
-//|  [HIGH]     Relaxed MR AND-gate: BB + 1 oscillator + 1 turning   |
-//|  [HIGH]     Relaxed trend AND-gate: removed candle shape filter   |
-//|  [MEDIUM]   Win rate floor raised to 35% (matches effective BE)   |
-//|  [MEDIUM]   Bootstrap WR corrected from 75% to 50%               |
-//|  [MEDIUM]   Partial close uses entry regime, not current regime   |
-//|  [MEDIUM]   Break-even skipped when trailing also fires           |
-//|  [MEDIUM]   Cooldown multiplier capped at 2x (was 3x)            |
-//|  [MEDIUM]   Quality score uses bar[1] ATR, session-aware bonus    |
-//|  [PERF]     ManageOpenPositions uses entry ATR from tracker       |
+//|  v6.0 Changes:                                                     |
+//|  [CRITICAL] Trade management overhaul: let winners run             |
+//|    - BE delayed to 2.0 ATR (was 0.8), offset 0.1 (was 0.3)       |
+//|    - Trail activation 2.5 ATR (was 1.5), distance 1.5 (was 1.0)  |
+//|    - Dynamic trail widened: 4R->0.75, 3R->1.0, 2.5R->1.25       |
+//|    - Partial close 25% at 3.0 ATR (was 30% at 2.5)               |
+//|  [CRITICAL] Regime-specific trade management profiles              |
+//|    - STRONG_TREND/WEAK_TREND/RANGING each have tuned BE/trail     |
+//|  [CRITICAL] Regime-specific Kelly sizing (uses per-regime stats)   |
+//|  [CRITICAL] Removed WR floor (was masking genuine edge loss)       |
+//|  [HIGH]     Self-healing: SafeCopyBuffer with retry + backoff      |
+//|  [HIGH]     Indicator handle validation + auto re-creation         |
+//|  [HIGH]     Connection drop detection + orphan position recovery   |
+//|  [HIGH]     State validation on load (detects corruption)          |
+//|  [HIGH]     Regime-aware EV check (per-regime stats when avail)    |
+//|  [HIGH]     Regime stats persistence across restarts               |
+//|  [MEDIUM]   Kelly reset parameter for fresh start after changes    |
+//|  [MEDIUM]   Optional volatile regime trading at reduced size       |
+//|  [MEDIUM]   BB touch tolerance parameterized (was hardcoded 0.2%) |
+//|  [MEDIUM]   Enhanced trade execution error handling                |
+//|  [MEDIUM]   EV tolerance band (10% of risk) for estimation noise  |
 //+------------------------------------------------------------------+
-#property copyright "AdaptiveRegimeEA v5.1"
-#property version   "5.10"
+#property copyright "AdaptiveRegimeEA v6.0"
+#property version   "6.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -95,6 +98,7 @@ input int         InpMR_StochD          = 3;          // Stochastic %D
 input int         InpMR_StochSlow       = 3;          // Stochastic Slowing
 input double      InpMR_StochOB         = 75.0;       // Stochastic OB - v5.1: widened from 80
 input double      InpMR_StochOS         = 25.0;       // Stochastic OS - v5.1: widened from 20
+input double      InpBBTouchTolerance   = 0.005;      // v6: BB touch tolerance (0.5%, was 0.2%)
 
 input group "=== Risk Management ==="
 input double      InpRiskPercent        = 1.0;        // Base Risk Per Trade (%)
@@ -110,6 +114,9 @@ input int         InpMaxPositions       = 3;          // Max Concurrent Position
 input int         InpMaxTradesPerDay    = 8;          // Max Trades Per Day
 input bool        InpUseKellyCriterion  = true;       // Use Kelly Criterion Sizing
 input double      InpKellyFraction      = 0.25;       // Kelly Safety Factor (0.25 = quarter-Kelly)
+input bool        InpUseRegimeKelly     = true;       // v6: Use regime-specific Kelly stats
+input int         InpRegimeKellyMinTrades = 15;       // v6: Min trades for regime Kelly
+input bool        InpResetKellyOnStart  = false;      // v6: Reset Kelly stats on init
 
 input group "=== Filters ==="
 input double      InpMaxSpreadCostPct   = 5.0;        // Max Spread as % of TP (trend)
@@ -120,17 +127,21 @@ input double      InpMinTradeQuality    = 0.55;       // Min Quality Score (0-1)
 
 input group "=== Trade Management ==="
 input bool        InpUsePartialClose    = true;       // Use Partial Close
-input double      InpPartialClosePct    = 30.0;       // Partial Close %
-input double      InpPartialCloseATR    = 2.5;        // Partial ATR trigger
-input bool        InpPartialOnlyStrong  = true;       // Partial Close only in STRONG_TREND
+input double      InpPartialClosePct    = 25.0;       // Partial Close % (v6: was 30)
+input double      InpPartialCloseATR    = 3.0;        // Partial ATR trigger (v6: was 2.5)
+input bool        InpPartialOnlyStrong  = false;      // v6: false — regime profiles handle this
 input bool        InpUseTrailingStop    = true;       // Use Trailing Stop
-input double      InpTrailATRMult       = 1.0;        // Trail ATR distance
-input double      InpTrailActivateATR   = 1.5;        // Trail activate ATR
+input double      InpTrailATRMult       = 1.5;        // Trail ATR distance (v6: was 1.0)
+input double      InpTrailActivateATR   = 2.5;        // Trail activate ATR (v6: was 1.5)
 input bool        InpUseDynamicTrail    = true;       // Dynamic trailing based on volatility
 input bool        InpUseBreakEven       = true;       // Use Break-Even
-input double      InpBreakEvenATR       = 0.8;        // Break-Even ATR
-input double      InpBreakEvenOffset    = 0.3;        // Break-Even offset ATR
+input double      InpBreakEvenATR       = 2.0;        // Break-Even ATR (v6: was 0.8)
+input double      InpBreakEvenOffset    = 0.1;        // Break-Even offset ATR (v6: was 0.3)
 input int         InpMaxHoldBars        = 100;        // Max Hold Bars (0=off)
+
+input group "=== Volatile Regime ==="
+input bool        InpAllowVolatileTrades = false;     // v6: Allow trades in VOLATILE regime
+input double      InpVolatileRiskMult    = 0.50;      // v6: Risk multiplier for VOLATILE
 
 input group "=== Session Filter ==="
 input bool        InpUseSessionFilter   = true;       // Use Session Filter
@@ -209,6 +220,11 @@ struct RegimeStats
    double avgLoss;
    double profitFactor;
    double sharpeRatio;
+   // v6: R-multiple tracking for regime-specific Kelly
+   double sumWinR;
+   double sumLossR;
+   int    winCount;
+   int    lossCount;
 };
 RegimeStats stats_StrongTrend, stats_WeakTrend, stats_Ranging;
 
@@ -227,6 +243,11 @@ double   todayProfitFactor     = 0;
 double   currentSharpe         = 0;
 double   maxAdverseExcursion   = 0;
 
+// v6: Self-healing state
+datetime lastSuccessfulTick    = 0;
+int      connectionDropCount   = 0;
+int      handleRecreateCount   = 0;
+
 //+------------------------------------------------------------------+
 //| Filling mode auto-detect                                          |
 //+------------------------------------------------------------------+
@@ -240,6 +261,207 @@ ENUM_ORDER_TYPE_FILLING DetectFillingMode()
    if((fillMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
       return ORDER_FILLING_IOC;
    return ORDER_FILLING_RETURN;
+}
+
+//+------------------------------------------------------------------+
+//| v6: SafeCopyBuffer with retry + exponential backoff               |
+//+------------------------------------------------------------------+
+int SafeCopyBuffer(int handle, int buffer_num, int start, int count, double &buffer[])
+{
+   for(int attempt = 1; attempt <= 3; attempt++)
+   {
+      int copied = CopyBuffer(handle, buffer_num, start, count, buffer);
+      if(copied >= count) return copied;
+      if(attempt < 3)
+      {
+         if(InpVerboseLog)
+            Print("CopyBuffer retry ", attempt, "/3 handle=", handle,
+                  " buf=", buffer_num, " err=", GetLastError());
+         Sleep(50 * attempt);
+         ResetLastError();
+      }
+   }
+   Print("WARNING: CopyBuffer FAILED after 3 retries, handle=", handle, " buf=", buffer_num);
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+//| v6: Safe CopyClose/CopyHigh/CopyLow wrappers                    |
+//+------------------------------------------------------------------+
+int SafeCopyClose(string sym, ENUM_TIMEFRAMES tf, int start, int count, double &buffer[])
+{
+   for(int attempt = 1; attempt <= 3; attempt++)
+   {
+      int copied = CopyClose(sym, tf, start, count, buffer);
+      if(copied >= count) return copied;
+      if(attempt < 3) { Sleep(50 * attempt); ResetLastError(); }
+   }
+   return -1;
+}
+
+int SafeCopyHigh(string sym, ENUM_TIMEFRAMES tf, int start, int count, double &buffer[])
+{
+   for(int attempt = 1; attempt <= 3; attempt++)
+   {
+      int copied = CopyHigh(sym, tf, start, count, buffer);
+      if(copied >= count) return copied;
+      if(attempt < 3) { Sleep(50 * attempt); ResetLastError(); }
+   }
+   return -1;
+}
+
+int SafeCopyLow(string sym, ENUM_TIMEFRAMES tf, int start, int count, double &buffer[])
+{
+   for(int attempt = 1; attempt <= 3; attempt++)
+   {
+      int copied = CopyLow(sym, tf, start, count, buffer);
+      if(copied >= count) return copied;
+      if(attempt < 3) { Sleep(50 * attempt); ResetLastError(); }
+   }
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+//| v6: Create all indicator handles (shared by OnInit + self-heal)  |
+//+------------------------------------------------------------------+
+bool CreateIndicatorHandles()
+{
+   h_ADX_HTF      = iADX(_Symbol, InpHTF, InpADXPeriod);
+   h_EMA_Fast_HTF = iMA(_Symbol, InpHTF, InpFastEMA, 0, MODE_EMA, PRICE_CLOSE);
+   h_EMA_Med_HTF  = iMA(_Symbol, InpHTF, InpMedEMA, 0, MODE_EMA, PRICE_CLOSE);
+   h_EMA_Slow_HTF = iMA(_Symbol, InpHTF, InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+   h_ADX_MTF      = iADX(_Symbol, InpMTF, InpADXPeriod);
+   h_BB_MTF       = iBands(_Symbol, InpMTF, InpBBPeriod, 0, InpBBDeviation, PRICE_CLOSE);
+   h_EMA_Fast_MTF = iMA(_Symbol, InpMTF, InpFastEMA, 0, MODE_EMA, PRICE_CLOSE);
+   h_EMA_Med_MTF  = iMA(_Symbol, InpMTF, InpMedEMA, 0, MODE_EMA, PRICE_CLOSE);
+   h_EMA_Slow_MTF = iMA(_Symbol, InpMTF, InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+   h_RSI_MTF      = iRSI(_Symbol, InpMTF, InpTrendRSIPeriod, PRICE_CLOSE);
+   h_ATR_MTF      = iATR(_Symbol, InpMTF, InpATRPeriod);
+   h_Stoch_MTF    = iStochastic(_Symbol, InpMTF, InpMR_StochK, InpMR_StochD, InpMR_StochSlow, MODE_SMA, STO_LOWHIGH);
+   h_RSI_LTF      = iRSI(_Symbol, InpLTF, InpMR_RSIPeriod, PRICE_CLOSE);
+   h_ATR_LTF      = iATR(_Symbol, InpLTF, InpATRPeriod);
+
+   return (h_ADX_HTF != INVALID_HANDLE && h_ADX_MTF != INVALID_HANDLE &&
+           h_BB_MTF != INVALID_HANDLE && h_EMA_Fast_HTF != INVALID_HANDLE &&
+           h_EMA_Med_HTF != INVALID_HANDLE && h_EMA_Slow_HTF != INVALID_HANDLE &&
+           h_EMA_Fast_MTF != INVALID_HANDLE && h_EMA_Med_MTF != INVALID_HANDLE &&
+           h_EMA_Slow_MTF != INVALID_HANDLE && h_RSI_MTF != INVALID_HANDLE &&
+           h_ATR_MTF != INVALID_HANDLE && h_Stoch_MTF != INVALID_HANDLE &&
+           h_RSI_LTF != INVALID_HANDLE && h_ATR_LTF != INVALID_HANDLE);
+}
+
+//+------------------------------------------------------------------+
+//| v6: Release all indicator handles safely                         |
+//+------------------------------------------------------------------+
+void ReleaseIndicatorHandles()
+{
+   if(h_ADX_HTF != INVALID_HANDLE) IndicatorRelease(h_ADX_HTF);
+   if(h_ADX_MTF != INVALID_HANDLE) IndicatorRelease(h_ADX_MTF);
+   if(h_BB_MTF != INVALID_HANDLE) IndicatorRelease(h_BB_MTF);
+   if(h_EMA_Fast_HTF != INVALID_HANDLE) IndicatorRelease(h_EMA_Fast_HTF);
+   if(h_EMA_Med_HTF != INVALID_HANDLE) IndicatorRelease(h_EMA_Med_HTF);
+   if(h_EMA_Slow_HTF != INVALID_HANDLE) IndicatorRelease(h_EMA_Slow_HTF);
+   if(h_EMA_Fast_MTF != INVALID_HANDLE) IndicatorRelease(h_EMA_Fast_MTF);
+   if(h_EMA_Med_MTF != INVALID_HANDLE) IndicatorRelease(h_EMA_Med_MTF);
+   if(h_EMA_Slow_MTF != INVALID_HANDLE) IndicatorRelease(h_EMA_Slow_MTF);
+   if(h_RSI_MTF != INVALID_HANDLE) IndicatorRelease(h_RSI_MTF);
+   if(h_ATR_MTF != INVALID_HANDLE) IndicatorRelease(h_ATR_MTF);
+   if(h_Stoch_MTF != INVALID_HANDLE) IndicatorRelease(h_Stoch_MTF);
+   if(h_RSI_LTF != INVALID_HANDLE) IndicatorRelease(h_RSI_LTF);
+   if(h_ATR_LTF != INVALID_HANDLE) IndicatorRelease(h_ATR_LTF);
+}
+
+//+------------------------------------------------------------------+
+//| v6: Validate handles and auto-recreate if invalid                |
+//+------------------------------------------------------------------+
+bool ValidateIndicatorHandles()
+{
+   bool allValid = (h_ADX_HTF != INVALID_HANDLE && h_ADX_MTF != INVALID_HANDLE &&
+                    h_BB_MTF != INVALID_HANDLE && h_EMA_Fast_HTF != INVALID_HANDLE &&
+                    h_EMA_Med_HTF != INVALID_HANDLE && h_EMA_Slow_HTF != INVALID_HANDLE &&
+                    h_EMA_Fast_MTF != INVALID_HANDLE && h_EMA_Med_MTF != INVALID_HANDLE &&
+                    h_EMA_Slow_MTF != INVALID_HANDLE && h_RSI_MTF != INVALID_HANDLE &&
+                    h_ATR_MTF != INVALID_HANDLE && h_Stoch_MTF != INVALID_HANDLE &&
+                    h_RSI_LTF != INVALID_HANDLE && h_ATR_LTF != INVALID_HANDLE);
+
+   if(allValid) return true;
+
+   Print("SELF-HEAL: Invalid indicator handle detected, recreating all...");
+   ReleaseIndicatorHandles();
+   bool ok = CreateIndicatorHandles();
+   if(ok)
+   {
+      handleRecreateCount++;
+      Print("SELF-HEAL SUCCESS: Handles recreated (total: ", handleRecreateCount, ")");
+   }
+   else
+      Print("SELF-HEAL FAILED: Could not recreate indicator handles");
+   return ok;
+}
+
+//+------------------------------------------------------------------+
+//| v6: Recover orphan positions not in activeTracker                |
+//+------------------------------------------------------------------+
+void ReconcilePositions()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Magic() != InpMagicNumber || posInfo.Symbol() != _Symbol) continue;
+
+      ulong ticket = posInfo.Ticket();
+      bool found = false;
+      for(int t = 0; t < ArraySize(activeTracker); t++)
+      {
+         if(activeTracker[t].ticket == ticket) { found = true; break; }
+      }
+      if(found) continue;
+
+      // Orphan: estimate entry ATR from current ATR
+      double atr_v[];
+      ArraySetAsSeries(atr_v, true);
+      double atr = 0;
+      if(SafeCopyBuffer(h_ATR_MTF, 0, 0, 1, atr_v) >= 1) atr = atr_v[0];
+
+      // Parse regime from trade comment (format: "AREA|REGIME_NAME")
+      ENUM_REGIME estRegime = REGIME_UNKNOWN;
+      string comment = PositionGetString(POSITION_COMMENT);
+      if(StringFind(comment, "STRONG_TREND") >= 0) estRegime = REGIME_STRONG_TREND;
+      else if(StringFind(comment, "WEAK_TREND") >= 0) estRegime = REGIME_WEAK_TREND;
+      else if(StringFind(comment, "RANGING") >= 0) estRegime = REGIME_RANGING;
+      else if(StringFind(comment, "VOLATILE") >= 0) estRegime = REGIME_VOLATILE;
+
+      ENUM_SIGNAL dir = (posInfo.PositionType() == POSITION_TYPE_BUY) ? SIGNAL_BUY : SIGNAL_SELL;
+      AddTradeRecord(ticket, estRegime, dir, posInfo.PriceOpen(), 0.5, atr);
+      Print("ORPHAN RECOVERY: #", ticket, " Regime=", RegimeToString(estRegime),
+            " ATR=", DoubleToString(atr, _Digits));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| v6: Get regime-specific Kelly parameters                         |
+//| Returns true if regime has enough data, fills p_out and b_out    |
+//+------------------------------------------------------------------+
+bool GetRegimeKelly(ENUM_REGIME regime, double &p_out, double &b_out)
+{
+   if(!InpUseRegimeKelly) return false;
+
+   RegimeStats rs;
+   if(regime == REGIME_STRONG_TREND) rs = stats_StrongTrend;
+   else if(regime == REGIME_WEAK_TREND) rs = stats_WeakTrend;
+   else if(regime == REGIME_RANGING) rs = stats_Ranging;
+   else return false;
+
+   int totalRegimeTrades = rs.winCount + rs.lossCount;
+   if(totalRegimeTrades < InpRegimeKellyMinTrades) return false;
+   if(rs.winCount == 0 || rs.lossCount == 0) return false;
+
+   p_out = (double)rs.winCount / totalRegimeTrades;
+   double avgW = rs.sumWinR / rs.winCount;
+   double avgL = rs.sumLossR / rs.lossCount;
+   if(avgL <= 0) return false;
+   b_out = avgW / avgL;
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -269,6 +491,39 @@ void SaveState()
    GlobalVariableSet(pfx + "avgWin",             historicalAvgWin);
    GlobalVariableSet(pfx + "avgLoss",            historicalAvgLoss);
    GlobalVariableSet(pfx + "totalTrades",        (double)totalClosedTrades);
+   // v6: Persist global Kelly counters (needed for simple average in first 30 trades)
+   GlobalVariableSet(pfx + "totalWins",         (double)totalWins);
+   GlobalVariableSet(pfx + "totalLosses",       (double)totalLosses);
+   GlobalVariableSet(pfx + "sumWinR",           sumWinR);
+   GlobalVariableSet(pfx + "sumLossR",          sumLossR);
+
+   // v6: Persist regime stats for regime-specific Kelly
+   GlobalVariableSet(pfx + "ST_winCount",  (double)stats_StrongTrend.winCount);
+   GlobalVariableSet(pfx + "ST_lossCount", (double)stats_StrongTrend.lossCount);
+   GlobalVariableSet(pfx + "ST_sumWinR",   stats_StrongTrend.sumWinR);
+   GlobalVariableSet(pfx + "ST_sumLossR",  stats_StrongTrend.sumLossR);
+   GlobalVariableSet(pfx + "ST_trades",    (double)stats_StrongTrend.trades);
+   GlobalVariableSet(pfx + "ST_wins",      (double)stats_StrongTrend.wins);
+   GlobalVariableSet(pfx + "ST_profit",    stats_StrongTrend.totalProfit);
+   GlobalVariableSet(pfx + "ST_loss",      stats_StrongTrend.totalLoss);
+
+   GlobalVariableSet(pfx + "WT_winCount",  (double)stats_WeakTrend.winCount);
+   GlobalVariableSet(pfx + "WT_lossCount", (double)stats_WeakTrend.lossCount);
+   GlobalVariableSet(pfx + "WT_sumWinR",   stats_WeakTrend.sumWinR);
+   GlobalVariableSet(pfx + "WT_sumLossR",  stats_WeakTrend.sumLossR);
+   GlobalVariableSet(pfx + "WT_trades",    (double)stats_WeakTrend.trades);
+   GlobalVariableSet(pfx + "WT_wins",      (double)stats_WeakTrend.wins);
+   GlobalVariableSet(pfx + "WT_profit",    stats_WeakTrend.totalProfit);
+   GlobalVariableSet(pfx + "WT_loss",      stats_WeakTrend.totalLoss);
+
+   GlobalVariableSet(pfx + "RG_winCount",  (double)stats_Ranging.winCount);
+   GlobalVariableSet(pfx + "RG_lossCount", (double)stats_Ranging.lossCount);
+   GlobalVariableSet(pfx + "RG_sumWinR",   stats_Ranging.sumWinR);
+   GlobalVariableSet(pfx + "RG_sumLossR",  stats_Ranging.sumLossR);
+   GlobalVariableSet(pfx + "RG_trades",    (double)stats_Ranging.trades);
+   GlobalVariableSet(pfx + "RG_wins",      (double)stats_Ranging.wins);
+   GlobalVariableSet(pfx + "RG_profit",    stats_Ranging.totalProfit);
+   GlobalVariableSet(pfx + "RG_loss",      stats_Ranging.totalLoss);
 }
 
 void LoadState()
@@ -307,6 +562,60 @@ void LoadState()
       historicalAvgWin   = GlobalVariableGet(pfx + "avgWin");
       historicalAvgLoss  = GlobalVariableGet(pfx + "avgLoss");
       totalClosedTrades  = (int)GlobalVariableGet(pfx + "totalTrades");
+      // v6: Restore global Kelly counters
+      totalWins          = (int)GlobalVariableGet(pfx + "totalWins");
+      totalLosses        = (int)GlobalVariableGet(pfx + "totalLosses");
+      sumWinR            = GlobalVariableGet(pfx + "sumWinR");
+      sumLossR           = GlobalVariableGet(pfx + "sumLossR");
+   }
+
+   // v6: Load regime stats
+   if(GlobalVariableCheck(pfx + "ST_winCount"))
+   {
+      stats_StrongTrend.winCount  = (int)GlobalVariableGet(pfx + "ST_winCount");
+      stats_StrongTrend.lossCount = (int)GlobalVariableGet(pfx + "ST_lossCount");
+      stats_StrongTrend.sumWinR   = GlobalVariableGet(pfx + "ST_sumWinR");
+      stats_StrongTrend.sumLossR  = GlobalVariableGet(pfx + "ST_sumLossR");
+      stats_StrongTrend.trades    = (int)GlobalVariableGet(pfx + "ST_trades");
+      stats_StrongTrend.wins      = (int)GlobalVariableGet(pfx + "ST_wins");
+      stats_StrongTrend.totalProfit = GlobalVariableGet(pfx + "ST_profit");
+      stats_StrongTrend.totalLoss = GlobalVariableGet(pfx + "ST_loss");
+
+      stats_WeakTrend.winCount  = (int)GlobalVariableGet(pfx + "WT_winCount");
+      stats_WeakTrend.lossCount = (int)GlobalVariableGet(pfx + "WT_lossCount");
+      stats_WeakTrend.sumWinR   = GlobalVariableGet(pfx + "WT_sumWinR");
+      stats_WeakTrend.sumLossR  = GlobalVariableGet(pfx + "WT_sumLossR");
+      stats_WeakTrend.trades    = (int)GlobalVariableGet(pfx + "WT_trades");
+      stats_WeakTrend.wins      = (int)GlobalVariableGet(pfx + "WT_wins");
+      stats_WeakTrend.totalProfit = GlobalVariableGet(pfx + "WT_profit");
+      stats_WeakTrend.totalLoss = GlobalVariableGet(pfx + "WT_loss");
+
+      stats_Ranging.winCount  = (int)GlobalVariableGet(pfx + "RG_winCount");
+      stats_Ranging.lossCount = (int)GlobalVariableGet(pfx + "RG_lossCount");
+      stats_Ranging.sumWinR   = GlobalVariableGet(pfx + "RG_sumWinR");
+      stats_Ranging.sumLossR  = GlobalVariableGet(pfx + "RG_sumLossR");
+      stats_Ranging.trades    = (int)GlobalVariableGet(pfx + "RG_trades");
+      stats_Ranging.wins      = (int)GlobalVariableGet(pfx + "RG_wins");
+      stats_Ranging.totalProfit = GlobalVariableGet(pfx + "RG_profit");
+      stats_Ranging.totalLoss = GlobalVariableGet(pfx + "RG_loss");
+   }
+
+   // v6: State validation — detect corruption
+   if(historicalWinRate < 0.05 || historicalWinRate > 0.99)
+   {
+      Print("STATE CORRUPT: WinRate=", historicalWinRate, " -- resetting to bootstrap");
+      historicalWinRate = 0.50; historicalAvgWin = 2.0; historicalAvgLoss = 1.0;
+      totalClosedTrades = 0;
+   }
+   if(historicalAvgWin <= 0 || historicalAvgLoss <= 0)
+   {
+      Print("STATE CORRUPT: AvgWin=", historicalAvgWin, " AvgLoss=", historicalAvgLoss, " -- resetting");
+      historicalAvgWin = 2.0; historicalAvgLoss = 1.0;
+   }
+   if(peakBalance > accInfo.Balance() * 5.0)
+   {
+      Print("STATE SUSPECT: peakBalance=", peakBalance, " >> balance -- resetting");
+      peakBalance = accInfo.Balance();
    }
 
    Print("STATE RESTORED: peak=", DoubleToString(peakBalance, 2),
@@ -334,42 +643,44 @@ int OnInit()
    symInfo.Name(_Symbol);
    symInfo.Refresh();
 
-   h_ADX_HTF      = iADX(_Symbol, InpHTF, InpADXPeriod);
-   h_EMA_Fast_HTF = iMA(_Symbol, InpHTF, InpFastEMA, 0, MODE_EMA, PRICE_CLOSE);
-   h_EMA_Med_HTF  = iMA(_Symbol, InpHTF, InpMedEMA, 0, MODE_EMA, PRICE_CLOSE);
-   h_EMA_Slow_HTF = iMA(_Symbol, InpHTF, InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
-   h_ADX_MTF      = iADX(_Symbol, InpMTF, InpADXPeriod);
-   h_BB_MTF       = iBands(_Symbol, InpMTF, InpBBPeriod, 0, InpBBDeviation, PRICE_CLOSE);
-   h_EMA_Fast_MTF = iMA(_Symbol, InpMTF, InpFastEMA, 0, MODE_EMA, PRICE_CLOSE);
-   h_EMA_Med_MTF  = iMA(_Symbol, InpMTF, InpMedEMA, 0, MODE_EMA, PRICE_CLOSE);
-   h_EMA_Slow_MTF = iMA(_Symbol, InpMTF, InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
-   h_RSI_MTF      = iRSI(_Symbol, InpMTF, InpTrendRSIPeriod, PRICE_CLOSE);
-   h_ATR_MTF      = iATR(_Symbol, InpMTF, InpATRPeriod);
-   h_Stoch_MTF    = iStochastic(_Symbol, InpMTF, InpMR_StochK, InpMR_StochD, InpMR_StochSlow, MODE_SMA, STO_LOWHIGH);
-   h_RSI_LTF      = iRSI(_Symbol, InpLTF, InpMR_RSIPeriod, PRICE_CLOSE);
-   h_ATR_LTF      = iATR(_Symbol, InpLTF, InpATRPeriod);
-
-   if(h_ADX_HTF == INVALID_HANDLE || h_ADX_MTF == INVALID_HANDLE ||
-      h_BB_MTF == INVALID_HANDLE || h_EMA_Fast_HTF == INVALID_HANDLE ||
-      h_EMA_Med_HTF == INVALID_HANDLE || h_EMA_Slow_HTF == INVALID_HANDLE ||
-      h_EMA_Fast_MTF == INVALID_HANDLE || h_EMA_Med_MTF == INVALID_HANDLE ||
-      h_EMA_Slow_MTF == INVALID_HANDLE || h_RSI_MTF == INVALID_HANDLE ||
-      h_ATR_MTF == INVALID_HANDLE || h_Stoch_MTF == INVALID_HANDLE ||
-      h_RSI_LTF == INVALID_HANDLE || h_ATR_LTF == INVALID_HANDLE)
+   // v6: Use shared handle creation function
+   if(!CreateIndicatorHandles())
    { Print("ERROR: Indicator handle creation failed"); return INIT_FAILED; }
 
    LoadState();
    if(peakBalance <= 0)       peakBalance = accInfo.Balance();
    if(dailyStartBalance <= 0) dailyStartBalance = accInfo.Balance();
 
-   Print("=== AdaptiveRegimeEA v5.1 initialized ===");
+   // v6: Kelly reset for fresh start after major changes
+   if(InpResetKellyOnStart)
+   {
+      Print("KELLY RESET: Clearing all stats for fresh start");
+      historicalWinRate = 0.50;
+      historicalAvgWin = 2.0;
+      historicalAvgLoss = 1.0;
+      totalClosedTrades = 0;
+      totalWins = 0;
+      totalLosses = 0;
+      sumWinR = 0;
+      sumLossR = 0;
+      ZeroMemory(stats_StrongTrend);
+      ZeroMemory(stats_WeakTrend);
+      ZeroMemory(stats_Ranging);
+   }
+
+   // v6: Recover any orphan positions not in tracker
+   ReconcilePositions();
+
+   Print("=== AdaptiveRegimeEA v6.0 initialized ===");
    Print("Symbol=", _Symbol, " | Fill=", EnumToString(DetectFillingMode()),
          " | Tester=", (MQLInfoInteger(MQL_TESTER) ? "YES" : "NO"));
    Print("Risk=", InpRiskPercent, "% | Kelly=", (InpUseKellyCriterion ? "ON" : "OFF"),
-         " (", DoubleToString(InpKellyFraction*100, 0), "%)");
+         " (", DoubleToString(InpKellyFraction*100, 0), "%) RegimeKelly=",
+         (InpUseRegimeKelly ? "ON" : "OFF"));
    Print("R:R Ratios: Trend ", DoubleToString(InpATRMultTP/InpATRMultSL, 1), ":1",
          " | MR ", DoubleToString(InpMR_ATRTP/InpMR_ATRSL, 1), ":1");
-   Print("Filters: Spread<", InpMaxSpreadCostPct, "% | Quality>", InpMinTradeQuality);
+   Print("Trade Mgmt: BE=", InpBreakEvenATR, "ATR Trail=", InpTrailActivateATR,
+         "ATR Partial=", InpPartialCloseATR, "ATR");
 
    return INIT_SUCCEEDED;
 }
@@ -380,13 +691,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    SaveState();
-   IndicatorRelease(h_ADX_HTF);  IndicatorRelease(h_ADX_MTF);
-   IndicatorRelease(h_BB_MTF);
-   IndicatorRelease(h_EMA_Fast_HTF); IndicatorRelease(h_EMA_Med_HTF); IndicatorRelease(h_EMA_Slow_HTF);
-   IndicatorRelease(h_EMA_Fast_MTF); IndicatorRelease(h_EMA_Med_MTF); IndicatorRelease(h_EMA_Slow_MTF);
-   IndicatorRelease(h_RSI_MTF);  IndicatorRelease(h_ATR_MTF);
-   IndicatorRelease(h_Stoch_MTF);
-   IndicatorRelease(h_RSI_LTF);  IndicatorRelease(h_ATR_LTF);
+   ReleaseIndicatorHandles();
    ObjectsDeleteAll(0, "AREA_");
    Comment("");
 }
@@ -398,6 +703,24 @@ void OnTick()
 {
    symInfo.Refresh();
    symInfo.RefreshRates();
+
+   // v6: Connection drop detection
+   datetime now = TimeCurrent();
+   if(lastSuccessfulTick > 0 && (now - lastSuccessfulTick) > 300)
+   {
+      connectionDropCount++;
+      Print("CONNECTION: Gap of ", (now - lastSuccessfulTick),
+            "s detected (drop #", connectionDropCount, ")");
+      if(!ValidateIndicatorHandles())
+      {
+         Print("CONNECTION RECOVERY: Handle validation failed, skipping");
+         lastSuccessfulTick = now;
+         return;
+      }
+      ReconcilePositions();
+   }
+   lastSuccessfulTick = now;
+
    CheckNewDay();
 
    double bal = accInfo.Balance();
@@ -410,6 +733,13 @@ void OnTick()
    datetime barTime = iTime(_Symbol, InpMTF, 0);
    if(barTime == lastBarTime) return;
    lastBarTime = barTime;
+
+   // v6: Validate indicator handles on each new bar
+   if(!ValidateIndicatorHandles())
+   {
+      Print("BLOCKED: Indicator handles invalid, waiting for self-heal");
+      return;
+   }
 
    if(InpVerboseLog) Print("--- NEW BAR ", TimeToString(barTime), " ---");
 
@@ -469,6 +799,14 @@ void OnTick()
       signal = GenerateMeanReversionSignal();
       if(InpVerboseLog && signal == SIGNAL_NONE)
          Print("NO MR SIGNAL generated");
+   }
+   else if(currentRegime == REGIME_VOLATILE && InpAllowVolatileTrades)
+   {
+      signal = GenerateTrendSignal();
+      if(InpVerboseLog && signal != SIGNAL_NONE)
+         Print("VOLATILE SIGNAL: ", (signal == SIGNAL_BUY ? "BUY" : "SELL"), " (reduced size)");
+      else if(InpVerboseLog && signal == SIGNAL_NONE)
+         Print("NO VOLATILE SIGNAL generated");
    }
    else
    {
@@ -614,18 +952,25 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
             historicalAvgLoss = historicalAvgLoss * (1.0 - alpha) + alpha * MathAbs(rMultiple);
          }
       }
-      // v5.1: Floor win rate at 35% (effective breakeven with partials ~34.5%)
-      historicalWinRate = MathMax(historicalWinRate, 0.35);
+      // v6: Removed WR floor — with fixed b-ratio (>1.5), even 45% WR is profitable.
+      // The floor masked genuine edge loss and prevented Kelly from properly sizing down.
    }
 
    // Update regime-specific statistics (include partial closes for P&L tracking)
+   // v6: Also accumulate R-multiples for regime-specific Kelly
    if(tradeRegime == REGIME_STRONG_TREND)
    {
       stats_StrongTrend.trades++;
       if(profit > 0)
-      { stats_StrongTrend.wins++; stats_StrongTrend.totalProfit += profit; }
+      {
+         stats_StrongTrend.wins++; stats_StrongTrend.totalProfit += profit;
+         if(!isPartialClose && slDist > 0) { stats_StrongTrend.winCount++; stats_StrongTrend.sumWinR += MathAbs(rMultiple); }
+      }
       else
-      { stats_StrongTrend.totalLoss += MathAbs(profit); }
+      {
+         stats_StrongTrend.totalLoss += MathAbs(profit);
+         if(!isPartialClose && slDist > 0) { stats_StrongTrend.lossCount++; stats_StrongTrend.sumLossR += MathAbs(rMultiple); }
+      }
       stats_StrongTrend.avgWin = (stats_StrongTrend.wins > 0) ? stats_StrongTrend.totalProfit / stats_StrongTrend.wins : 0;
       stats_StrongTrend.avgLoss = ((stats_StrongTrend.trades - stats_StrongTrend.wins) > 0) ? stats_StrongTrend.totalLoss / (stats_StrongTrend.trades - stats_StrongTrend.wins) : 0;
       stats_StrongTrend.profitFactor = (stats_StrongTrend.totalLoss > 0) ? stats_StrongTrend.totalProfit / stats_StrongTrend.totalLoss : 0;
@@ -634,9 +979,15 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    {
       stats_WeakTrend.trades++;
       if(profit > 0)
-      { stats_WeakTrend.wins++; stats_WeakTrend.totalProfit += profit; }
+      {
+         stats_WeakTrend.wins++; stats_WeakTrend.totalProfit += profit;
+         if(!isPartialClose && slDist > 0) { stats_WeakTrend.winCount++; stats_WeakTrend.sumWinR += MathAbs(rMultiple); }
+      }
       else
-      { stats_WeakTrend.totalLoss += MathAbs(profit); }
+      {
+         stats_WeakTrend.totalLoss += MathAbs(profit);
+         if(!isPartialClose && slDist > 0) { stats_WeakTrend.lossCount++; stats_WeakTrend.sumLossR += MathAbs(rMultiple); }
+      }
       stats_WeakTrend.avgWin = (stats_WeakTrend.wins > 0) ? stats_WeakTrend.totalProfit / stats_WeakTrend.wins : 0;
       stats_WeakTrend.avgLoss = ((stats_WeakTrend.trades - stats_WeakTrend.wins) > 0) ? stats_WeakTrend.totalLoss / (stats_WeakTrend.trades - stats_WeakTrend.wins) : 0;
       stats_WeakTrend.profitFactor = (stats_WeakTrend.totalLoss > 0) ? stats_WeakTrend.totalProfit / stats_WeakTrend.totalLoss : 0;
@@ -645,9 +996,15 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    {
       stats_Ranging.trades++;
       if(profit > 0)
-      { stats_Ranging.wins++; stats_Ranging.totalProfit += profit; }
+      {
+         stats_Ranging.wins++; stats_Ranging.totalProfit += profit;
+         if(!isPartialClose && slDist > 0) { stats_Ranging.winCount++; stats_Ranging.sumWinR += MathAbs(rMultiple); }
+      }
       else
-      { stats_Ranging.totalLoss += MathAbs(profit); }
+      {
+         stats_Ranging.totalLoss += MathAbs(profit);
+         if(!isPartialClose && slDist > 0) { stats_Ranging.lossCount++; stats_Ranging.sumLossR += MathAbs(rMultiple); }
+      }
       stats_Ranging.avgWin = (stats_Ranging.wins > 0) ? stats_Ranging.totalProfit / stats_Ranging.wins : 0;
       stats_Ranging.avgLoss = ((stats_Ranging.trades - stats_Ranging.wins) > 0) ? stats_Ranging.totalLoss / (stats_Ranging.trades - stats_Ranging.wins) : 0;
       stats_Ranging.profitFactor = (stats_Ranging.totalLoss > 0) ? stats_Ranging.totalProfit / stats_Ranging.totalLoss : 0;
@@ -702,11 +1059,11 @@ ENUM_REGIME DetectRegime()
    ArraySetAsSeries(bb_upper, true); ArraySetAsSeries(bb_lower, true); ArraySetAsSeries(bb_mid, true);
 
    int need = InpRegimeLookback + 1;
-   if(CopyBuffer(h_ADX_HTF, 0, 0, need, adx_htf) < need) return currentRegime;
-   if(CopyBuffer(h_ADX_MTF, 0, 0, need, adx_mtf) < need) return currentRegime;
-   if(CopyBuffer(h_BB_MTF, 1, 0, need, bb_upper) < need) return currentRegime;
-   if(CopyBuffer(h_BB_MTF, 2, 0, need, bb_lower) < need) return currentRegime;
-   if(CopyBuffer(h_BB_MTF, 0, 0, need, bb_mid)   < need) return currentRegime;
+   if(SafeCopyBuffer(h_ADX_HTF, 0, 0, need, adx_htf) < need) return currentRegime;
+   if(SafeCopyBuffer(h_ADX_MTF, 0, 0, need, adx_mtf) < need) return currentRegime;
+   if(SafeCopyBuffer(h_BB_MTF, 1, 0, need, bb_upper) < need) return currentRegime;
+   if(SafeCopyBuffer(h_BB_MTF, 2, 0, need, bb_lower) < need) return currentRegime;
+   if(SafeCopyBuffer(h_BB_MTF, 0, 0, need, bb_mid)   < need) return currentRegime;
 
    // Use bar[1] - last COMPLETED bar
    double adxNow = adx_htf[1];
@@ -777,11 +1134,11 @@ ENUM_TREND_DIR DetectTrendDirection()
    ArraySetAsSeries(emaFast_H, true); ArraySetAsSeries(emaMed_H, true); ArraySetAsSeries(emaSlow_H, true);
    ArraySetAsSeries(emaFast_M, true); ArraySetAsSeries(emaMed_M, true);
 
-   if(CopyBuffer(h_EMA_Fast_HTF, 0, 0, 3, emaFast_H) < 3) return TREND_NEUTRAL;
-   if(CopyBuffer(h_EMA_Med_HTF,  0, 0, 3, emaMed_H)  < 3) return TREND_NEUTRAL;
-   if(CopyBuffer(h_EMA_Slow_HTF, 0, 0, 3, emaSlow_H) < 3) return TREND_NEUTRAL;
-   if(CopyBuffer(h_EMA_Fast_MTF, 0, 0, 3, emaFast_M) < 3) return TREND_NEUTRAL;
-   if(CopyBuffer(h_EMA_Med_MTF,  0, 0, 3, emaMed_M)  < 3) return TREND_NEUTRAL;
+   if(SafeCopyBuffer(h_EMA_Fast_HTF, 0, 0, 3, emaFast_H) < 3) return TREND_NEUTRAL;
+   if(SafeCopyBuffer(h_EMA_Med_HTF,  0, 0, 3, emaMed_H)  < 3) return TREND_NEUTRAL;
+   if(SafeCopyBuffer(h_EMA_Slow_HTF, 0, 0, 3, emaSlow_H) < 3) return TREND_NEUTRAL;
+   if(SafeCopyBuffer(h_EMA_Fast_MTF, 0, 0, 3, emaFast_M) < 3) return TREND_NEUTRAL;
+   if(SafeCopyBuffer(h_EMA_Med_MTF,  0, 0, 3, emaMed_M)  < 3) return TREND_NEUTRAL;
 
    // Use bar[1] for completed data
    bool htfBull = (emaFast_H[1] > emaMed_H[1] && emaMed_H[1] > emaSlow_H[1]);
@@ -791,7 +1148,7 @@ ENUM_TREND_DIR DetectTrendDirection()
 
    double close_htf[];
    ArraySetAsSeries(close_htf, true);
-   if(CopyClose(_Symbol, InpHTF, 0, 2, close_htf) < 2) return TREND_NEUTRAL;
+   if(SafeCopyClose(_Symbol, InpHTF, 0, 2, close_htf) < 2) return TREND_NEUTRAL;
    bool priceAbove = (close_htf[1] > emaSlow_H[1]);
    bool priceBelow = (close_htf[1] < emaSlow_H[1]);
 
@@ -838,14 +1195,14 @@ ENUM_SIGNAL GenerateTrendSignal()
    ArraySetAsSeries(close_m, true); ArraySetAsSeries(high_m, true);
    ArraySetAsSeries(low_m, true); ArraySetAsSeries(atr_m, true);
 
-   if(CopyBuffer(h_RSI_MTF, 0, 0, 8, rsi_mtf) < 8) return SIGNAL_NONE;
-   if(CopyBuffer(h_RSI_LTF, 0, 0, 8, rsi_ltf) < 8) return SIGNAL_NONE;
-   if(CopyBuffer(h_EMA_Fast_MTF, 0, 0, 8, emaFast_M) < 8) return SIGNAL_NONE;
-   if(CopyBuffer(h_EMA_Med_MTF, 0, 0, 8, emaMed_M) < 8) return SIGNAL_NONE;
-   if(CopyBuffer(h_ATR_MTF, 0, 0, 8, atr_m) < 8) return SIGNAL_NONE;
-   if(CopyClose(_Symbol, InpMTF, 0, 8, close_m) < 8) return SIGNAL_NONE;
-   if(CopyHigh(_Symbol, InpMTF, 0, 8, high_m)  < 8) return SIGNAL_NONE;
-   if(CopyLow(_Symbol, InpMTF, 0, 8, low_m)    < 8) return SIGNAL_NONE;
+   if(SafeCopyBuffer(h_RSI_MTF, 0, 0, 8, rsi_mtf) < 8) return SIGNAL_NONE;
+   if(SafeCopyBuffer(h_RSI_LTF, 0, 0, 8, rsi_ltf) < 8) return SIGNAL_NONE;
+   if(SafeCopyBuffer(h_EMA_Fast_MTF, 0, 0, 8, emaFast_M) < 8) return SIGNAL_NONE;
+   if(SafeCopyBuffer(h_EMA_Med_MTF, 0, 0, 8, emaMed_M) < 8) return SIGNAL_NONE;
+   if(SafeCopyBuffer(h_ATR_MTF, 0, 0, 8, atr_m) < 8) return SIGNAL_NONE;
+   if(SafeCopyClose(_Symbol, InpMTF, 0, 8, close_m) < 8) return SIGNAL_NONE;
+   if(SafeCopyHigh(_Symbol, InpMTF, 0, 8, high_m)  < 8) return SIGNAL_NONE;
+   if(SafeCopyLow(_Symbol, InpMTF, 0, 8, low_m)    < 8) return SIGNAL_NONE;
 
    // v5.1: Widened pullback zone from 1.0 to 1.5 ATR
    double pullbackATR = InpDiagnosticMode ? atr_m[2] * 2.0 : atr_m[2] * 1.5;
@@ -911,16 +1268,17 @@ ENUM_SIGNAL GenerateMeanReversionSignal()
    ArraySetAsSeries(rsi, true); ArraySetAsSeries(stK, true); ArraySetAsSeries(stD, true);
    ArraySetAsSeries(cl, true);
 
-   if(CopyBuffer(h_BB_MTF, 1, 0, 4, bb_u) < 4) return SIGNAL_NONE;
-   if(CopyBuffer(h_BB_MTF, 2, 0, 4, bb_l) < 4) return SIGNAL_NONE;
-   if(CopyBuffer(h_BB_MTF, 0, 0, 4, bb_m) < 4) return SIGNAL_NONE;
-   if(CopyBuffer(h_RSI_LTF, 0, 0, 4, rsi) < 4) return SIGNAL_NONE;
-   if(CopyBuffer(h_Stoch_MTF, 0, 0, 4, stK) < 4) return SIGNAL_NONE;
-   if(CopyBuffer(h_Stoch_MTF, 1, 0, 4, stD) < 4) return SIGNAL_NONE;
-   if(CopyClose(_Symbol, InpMTF, 0, 4, cl) < 4) return SIGNAL_NONE;
+   if(SafeCopyBuffer(h_BB_MTF, 1, 0, 4, bb_u) < 4) return SIGNAL_NONE;
+   if(SafeCopyBuffer(h_BB_MTF, 2, 0, 4, bb_l) < 4) return SIGNAL_NONE;
+   if(SafeCopyBuffer(h_BB_MTF, 0, 0, 4, bb_m) < 4) return SIGNAL_NONE;
+   if(SafeCopyBuffer(h_RSI_LTF, 0, 0, 4, rsi) < 4) return SIGNAL_NONE;
+   if(SafeCopyBuffer(h_Stoch_MTF, 0, 0, 4, stK) < 4) return SIGNAL_NONE;
+   if(SafeCopyBuffer(h_Stoch_MTF, 1, 0, 4, stD) < 4) return SIGNAL_NONE;
+   if(SafeCopyClose(_Symbol, InpMTF, 0, 4, cl) < 4) return SIGNAL_NONE;
 
    // BUY: bar[2] touched lower BB, bar[1] shows reversal
-   bool touchLow = (cl[2] <= bb_l[2] * 1.002);  // v5.1: slightly wider tolerance
+   // v6: Parameterized tolerance (was hardcoded 0.2%)
+   bool touchLow = (cl[2] <= bb_l[2] * (1.0 + InpBBTouchTolerance));
    if(touchLow)
    {
       bool rsiOS     = (rsi[2] < InpMR_RSI_OS);
@@ -942,7 +1300,8 @@ ENUM_SIGNAL GenerateMeanReversionSignal()
    }
 
    // SELL: bar[2] touched upper BB, bar[1] shows reversal
-   bool touchHi = (cl[2] >= bb_u[2] * 0.998);  // v5.1: slightly wider tolerance
+   // v6: Parameterized tolerance (was hardcoded 0.2%)
+   bool touchHi = (cl[2] >= bb_u[2] * (1.0 - InpBBTouchTolerance));
    if(touchHi)
    {
       bool rsiOB     = (rsi[2] > InpMR_RSI_OB);
@@ -972,7 +1331,7 @@ bool IsSpreadAcceptable()
 {
    double atr_v[];
    ArraySetAsSeries(atr_v, true);
-   if(CopyBuffer(h_ATR_MTF, 0, 0, 1, atr_v) < 1) return false;
+   if(SafeCopyBuffer(h_ATR_MTF, 0, 0, 1, atr_v) < 1) return false;
    double atr = atr_v[0];
    if(atr <= 0) return false;
 
@@ -1007,9 +1366,9 @@ double CalculateTradeQuality(ENUM_SIGNAL signal)
    double adx[], rsi[], atr[];
    ArraySetAsSeries(adx, true); ArraySetAsSeries(rsi, true); ArraySetAsSeries(atr, true);
 
-   if(CopyBuffer(h_ADX_HTF, 0, 0, 3, adx) < 3) return score;
-   if(CopyBuffer(h_RSI_MTF, 0, 0, 3, rsi) < 3) return score;
-   if(CopyBuffer(h_ATR_MTF, 0, 0, 10, atr) < 10) return score;
+   if(SafeCopyBuffer(h_ADX_HTF, 0, 0, 3, adx) < 3) return score;
+   if(SafeCopyBuffer(h_RSI_MTF, 0, 0, 3, rsi) < 3) return score;
+   if(SafeCopyBuffer(h_ATR_MTF, 0, 0, 10, atr) < 10) return score;
 
    // 1. Trend strength (0-0.25 points)
    if(adx[1] >= InpADXStrongThresh) score += 0.25;
@@ -1050,27 +1409,49 @@ double CalculateTradeQuality(ENUM_SIGNAL signal)
 
 //+------------------------------------------------------------------+
 //| EXPECTED VALUE CHECK                                              |
-//| v5.1: Re-enabled as blocking filter with corrected inputs         |
-//| (entry ATR, no partial close contamination, stable alpha)          |
+//| v5.2: Added 10% tolerance band for estimation noise. With ~60     |
+//| trades, WR/avgW/avgL estimates have significant variance — a      |
+//| marginally negative EV (e.g. -$0.30) is indistinguishable from   |
+//| breakeven. Only block when EV is meaningfully negative.            |
 //+------------------------------------------------------------------+
-bool IsPositiveExpectedValue(double riskAmt, double atrDist)
+bool IsPositiveExpectedValue(double riskAmt, ENUM_REGIME regime = REGIME_UNKNOWN)
 {
-   // v5.1: Need 30 trades for stable estimates (up from 20)
    if(totalClosedTrades < 30) return true;
 
-   double avgWinDollars = riskAmt * historicalAvgWin;
-   double avgLossDollars = riskAmt * historicalAvgLoss;
+   double wr = historicalWinRate;
+   double aw = historicalAvgWin;
+   double al = historicalAvgLoss;
 
-   double ev = (historicalWinRate * avgWinDollars) - ((1.0 - historicalWinRate) * avgLossDollars);
+   // v6: Use regime-specific stats when available
+   if(InpUseRegimeKelly && regime != REGIME_UNKNOWN)
+   {
+      double regWR, regB;
+      if(GetRegimeKelly(regime, regWR, regB))
+      {
+         wr = regWR;
+         aw = regB;  // GetRegimeKelly returns b-ratio (avgWin/avgLoss)
+         al = 1.0;   // Normalize: avgLoss=1.0, avgWin=b
+      }
+   }
 
-   if(InpVerboseLog && ev <= 0)
+   double avgWinDollars = riskAmt * aw;
+   double avgLossDollars = riskAmt * al;
+
+   double ev = (wr * avgWinDollars) - ((1.0 - wr) * avgLossDollars);
+
+   // v5.2: Tolerance band — allow EV down to -10% of risk amount (noise margin)
+   double tolerance = riskAmt * 0.10;
+
+   if(InpVerboseLog && ev < -tolerance)
       Print("NEGATIVE EV: $", DoubleToString(ev, 2),
-            " WR=", DoubleToString(historicalWinRate*100,1), "%",
-            " avgW=", DoubleToString(historicalAvgWin, 2),
-            " avgL=", DoubleToString(historicalAvgLoss, 2),
+            " (tol=$", DoubleToString(-tolerance, 2), ")",
+            " WR=", DoubleToString(wr*100,1), "%",
+            " avgW=", DoubleToString(aw, 2),
+            " avgL=", DoubleToString(al, 2),
+            " regime=", RegimeToString(regime),
             " trades=", totalClosedTrades);
 
-   return ev > 0;
+   return ev > -tolerance;
 }
 
 //+------------------------------------------------------------------+
@@ -1110,7 +1491,7 @@ void ExecuteTrade(ENUM_SIGNAL signal, double qualityScore = 0.7)
 
    double atr_v[];
    ArraySetAsSeries(atr_v, true);
-   if(CopyBuffer(h_ATR_MTF, 0, 0, 1, atr_v) < 1) return;
+   if(SafeCopyBuffer(h_ATR_MTF, 0, 0, 1, atr_v) < 1) return;
    double atr = atr_v[0];
    if(atr <= 0) return;
 
@@ -1127,46 +1508,62 @@ void ExecuteTrade(ENUM_SIGNAL signal, double qualityScore = 0.7)
    double minStop = stopsLvl * _Point;
    if(slDist < minStop && minStop > 0) slDist = minStop * 1.1;
 
-   // Kelly Criterion position sizing
+   // Kelly Criterion position sizing — v6: regime-specific when available
    double adjRisk = InpRiskPercent;
 
    if(InpUseKellyCriterion && totalClosedTrades >= 30)
    {
       double p = historicalWinRate;
-      double q = 1.0 - p;
       double b = (historicalAvgLoss > 0) ? historicalAvgWin / historicalAvgLoss : 2.0;
+      string kellySource = "global";
 
+      // v6: Try regime-specific Kelly first
+      if(InpUseRegimeKelly)
+      {
+         double regWR, regB;
+         if(GetRegimeKelly(currentRegime, regWR, regB))
+         {
+            p = regWR;
+            b = regB;
+            kellySource = RegimeToString(currentRegime);
+         }
+      }
+
+      double q = 1.0 - p;
       double kellyPct = (p * b - q) / b;
       if(kellyPct > 0)
       {
          adjRisk = kellyPct * 100.0 * InpKellyFraction;
          adjRisk = MathMin(adjRisk, InpRiskPercent * 1.5); // Cap at 1.5x base
-         // v5.1: Removed 0.5x floor - let Kelly size down properly
          adjRisk = MathMax(adjRisk, InpRiskPercent * 0.1);  // Minimum 10% of base
 
          if(InpVerboseLog)
-            Print("Kelly: WR=", DoubleToString(p*100,1), "% b=", DoubleToString(b,2),
+            Print("Kelly[", kellySource, "]: WR=", DoubleToString(p*100,1), "% b=", DoubleToString(b,2),
                   " kelly=", DoubleToString(kellyPct*100,1), "% adj=", DoubleToString(adjRisk,2), "%");
       }
       else
       {
-         // v5.1: Negative Kelly = no edge detected -> reduce to minimum
          adjRisk = InpRiskPercent * 0.25;
          if(InpVerboseLog)
-            Print("Kelly NEGATIVE: WR=", DoubleToString(p*100,1), "% b=", DoubleToString(b,2),
+            Print("Kelly NEGATIVE[", kellySource, "]: WR=", DoubleToString(p*100,1), "% b=", DoubleToString(b,2),
                   " -> reduced to ", DoubleToString(adjRisk,2), "%");
       }
    }
+
+   // v6: Apply volatile regime risk multiplier
+   if(currentRegime == REGIME_VOLATILE && InpAllowVolatileTrades)
+      adjRisk *= InpVolatileRiskMult;
 
    double lotSize = CalcLots(slDist, adjRisk);
    if(lotSize <= 0) return;
 
    // v5.1: EV check re-enabled as blocking filter (inputs now corrected)
    double riskAmt = accInfo.Balance() * adjRisk / 100.0;
-   if(!IsPositiveExpectedValue(riskAmt, slDist))
+   if(!IsPositiveExpectedValue(riskAmt, currentRegime))
    {
       Print("SKIP: Negative expected value (WR=", DoubleToString(historicalWinRate*100,1),
-            "% trades=", totalClosedTrades, ")");
+            "% regime=", RegimeToString(currentRegime),
+            " trades=", totalClosedTrades, ")");
       return;
    }
 
@@ -1220,6 +1617,21 @@ void ExecuteTrade(ENUM_SIGNAL signal, double qualityScore = 0.7)
 
       if(rc == TRADE_RETCODE_INVALID_FILL)
       { trade.SetTypeFilling(ORDER_FILLING_RETURN); continue; }
+
+      // v6: Specific handling for common permanent errors
+      if(rc == TRADE_RETCODE_NO_MONEY)
+      {
+         Print("NO_MONEY: FreeMargin=$", DoubleToString(accInfo.FreeMargin(), 2),
+               " Balance=$", DoubleToString(accInfo.Balance(), 2),
+               " Lots=", DoubleToString(lotSize, 2));
+         return;
+      }
+      if(rc == TRADE_RETCODE_MARKET_CLOSED)
+      {
+         Print("MARKET_CLOSED: resetting lastBarTime to force re-eval next bar");
+         lastBarTime = 0;
+         return;
+      }
 
       Print("FAILED (permanent): ", rc, " ", trade.ResultRetcodeDescription());
       return;
@@ -1292,7 +1704,7 @@ void ManageOpenPositions()
       {
          double atr_v[];
          ArraySetAsSeries(atr_v, true);
-         if(CopyBuffer(h_ATR_MTF, 0, 0, 1, atr_v) >= 1)
+         if(SafeCopyBuffer(h_ATR_MTF, 0, 0, 1, atr_v) >= 1)
             entryAtr = atr_v[0];
          if(entryAtr <= 0) continue;
       }
@@ -1311,16 +1723,49 @@ void ManageOpenPositions()
          }
       }
 
-      // 2. PARTIAL CLOSE - v5.1: Uses ENTRY regime, not current regime
-      if(InpUsePartialClose && !IsPartialDone(ticket))
+      // v6: Regime-specific trade management parameters
+      double localBE_ATR     = InpBreakEvenATR;
+      double localTrailAct   = InpTrailActivateATR;
+      double localTrailDist  = InpTrailATRMult;
+      double localPartialPct = InpPartialClosePct;
+      double localPartialATR = InpPartialCloseATR;
+
+      if(entryRegime == REGIME_STRONG_TREND)
+      {
+         localBE_ATR     = 2.5;
+         localTrailAct   = 3.0;
+         localTrailDist  = 1.5;
+         localPartialPct = 25.0;
+         localPartialATR = 3.5;
+      }
+      else if(entryRegime == REGIME_WEAK_TREND)
+      {
+         localBE_ATR     = 2.0;
+         localTrailAct   = 2.5;
+         localTrailDist  = 1.25;
+         localPartialPct = 25.0;
+         localPartialATR = 3.0;
+      }
+      else if(entryRegime == REGIME_RANGING)
+      {
+         localBE_ATR     = 1.0;
+         localTrailAct   = 1.5;
+         localTrailDist  = 0.5;
+         localPartialPct = 0.0;  // No partial — TP too close at 2.0 ATR
+         localPartialATR = 99.0; // Effectively disabled
+      }
+      // REGIME_UNKNOWN / REGIME_VOLATILE: use input defaults
+
+      // 2. PARTIAL CLOSE - v6: Uses regime-specific parameters
+      if(InpUsePartialClose && !IsPartialDone(ticket) && localPartialPct > 0)
       {
          bool allowPartial = true;
          if(InpPartialOnlyStrong && entryRegime != REGIME_STRONG_TREND)
             allowPartial = false;
 
-         if(allowPartial && dist >= entryAtr * InpPartialCloseATR)
+         if(allowPartial && dist >= entryAtr * localPartialATR)
          {
-            double cLots = NormalizeDouble(posInfo.Volume() * InpPartialClosePct / 100.0, 2);
+            double cLots = NormalizeDouble(posInfo.Volume() * localPartialPct / 100.0, 2);
             double ml = symInfo.LotsMin();
             double ls = symInfo.LotsStep();
             if(ls > 0) cLots = MathFloor(cLots / ls) * ls;
@@ -1334,11 +1779,11 @@ void ManageOpenPositions()
          }
       }
 
-      // v5.1: Determine if trailing will also fire (avoid redundant BE modify)
-      bool trailingWillFire = (InpUseTrailingStop && dist >= entryAtr * InpTrailActivateATR);
+      // v6: Determine if trailing will also fire (avoid redundant BE modify)
+      bool trailingWillFire = (InpUseTrailingStop && dist >= entryAtr * localTrailAct);
 
-      // 3. BREAK-EVEN - v5.1: Skip if trailing stop will also fire on this tick
-      if(InpUseBreakEven && !trailingWillFire && dist >= entryAtr * InpBreakEvenATR)
+      // 3. BREAK-EVEN - v6: Regime-specific threshold, skip if trailing fires
+      if(InpUseBreakEven && !trailingWillFire && dist >= entryAtr * localBE_ATR)
       {
          double beOff = entryAtr * InpBreakEvenOffset;
          double newSL;
@@ -1354,17 +1799,19 @@ void ManageOpenPositions()
          }
       }
 
-      // 4. TRAILING STOP - Dynamic based on profit level, uses entry ATR
+      // 4. TRAILING STOP - v6: Regime-specific base trail, relaxed dynamic tightening
       if(trailingWillFire)
       {
-         double trDist = entryAtr * InpTrailATRMult;
+         double trDist = entryAtr * localTrailDist;
          double rMultiple = dist / entryAtr;
 
+         // v6: Relaxed dynamic trail — only tighten above 2.5R
          if(InpUseDynamicTrail)
          {
-            if(rMultiple >= 3.0)      trDist = entryAtr * 0.5;
-            else if(rMultiple >= 2.0) trDist = entryAtr * 0.75;
-            else if(rMultiple >= 1.5) trDist = entryAtr * 1.0;
+            if(rMultiple >= 4.0)      trDist = entryAtr * 0.75;
+            else if(rMultiple >= 3.0) trDist = entryAtr * 1.0;
+            else if(rMultiple >= 2.5) trDist = entryAtr * 1.25;
+            // Below 2.5R: use localTrailDist (regime-specific base)
          }
 
          double newSL;
@@ -1598,7 +2045,7 @@ void DrawDashboard()
    int x = 10, y = 30, lh = 16;
    string p = "AREA_";
 
-   DL(p+"t", x, y, "=== ADAPTIVE REGIME EA v5.1 ===", clrGold, 10); y += lh+3;
+   DL(p+"t", x, y, "=== ADAPTIVE REGIME EA v6.0 ===", clrGold, 10); y += lh+3;
 
    double bal = accInfo.Balance(), eq = accInfo.Equity();
    double dd = (peakBalance > 0) ? (peakBalance - eq) / peakBalance * 100.0 : 0;
